@@ -12,7 +12,6 @@ import org.slf4j.LoggerFactory;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.AnswerPreCheckoutQuery;
-import org.telegram.telegrambots.meta.api.methods.invoices.SendInvoice;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
@@ -395,7 +394,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return;
         }
 
-        SendInvoice invoice = new SendInvoice();
+        StarsSendInvoice invoice = new StarsSendInvoice();
         invoice.setChatId(String.valueOf(userId));
         invoice.setTitle("Публикация рекламного поста");
         invoice.setDescription("Моментальная публикация вашего поста в группе.");
