@@ -108,6 +108,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
             database.touchAdminUsername(userId, username);
         }
 
+        if (!isPrivateMessage(message)) {
+            return;
+        }
+
         if (message.hasSuccessfulPayment()) {
             handleSuccessfulPayment(message);
             return;
@@ -143,6 +147,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
         long userId = from.getId();
         if (database.isAdmin(userId)) {
             database.touchAdminUsername(userId, from.getUserName());
+        }
+
+        if (!isPrivateCallback(query)) {
+            return;
         }
 
         String data = query.getData();
@@ -1017,5 +1025,16 @@ public class StarsPostBot extends TelegramLongPollingBot {
         } catch (Exception ignored) {
             return isoInstant;
         }
+    }
+
+    private boolean isPrivateMessage(Message message) {
+        return message.getChat() != null && Boolean.TRUE.equals(message.getChat().isUserChat());
+    }
+
+    private boolean isPrivateCallback(CallbackQuery query) {
+        if (query.getMessage() == null) {
+            return false;
+        }
+        return query.getMessage().isUserMessage();
     }
 }
