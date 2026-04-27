@@ -1,6 +1,7 @@
 package com.example.starsbot;
 
 import com.example.starsbot.model.AdminInfo;
+import com.example.starsbot.model.AutoPostJob;
 import com.example.starsbot.model.ConversationState;
 import com.example.starsbot.model.Draft;
 import com.example.starsbot.model.DraftStatus;
@@ -15,6 +16,7 @@ import org.telegram.telegrambots.meta.api.methods.AnswerPreCheckoutQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
 import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
 import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.api.objects.Message;
@@ -29,6 +31,8 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKe
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.sql.SQLException;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -36,6 +40,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -44,6 +51,8 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String CURRENCY_STARS = "XTR";
     private static final int MAX_CAPTION_LENGTH = 1024;
     private static final Pattern PAYLOAD_PATTERN = Pattern.compile("^draft:(\\d+)(?::(\\d+))?$");
+    private static final Duration CAMPAIGN_DURATION = Duration.ofDays(7);
+    private static final Duration FAILED_RETRY_DELAY = Duration.ofMinutes(10);
 
     private static final String CB_MAKE_POST = "make_post";
     private static final String CB_ADMIN_MENU = "admin_menu";
@@ -54,15 +63,29 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String CB_ADMIN_ADD_ADMIN = "admin_add_admin";
     private static final String CB_ADMIN_REMOVE_MENU = "admin_remove_menu";
     private static final String CB_ADMIN_TOGGLE_TEST_MODE = "admin_toggle_test_mode";
-    private static final String CB_ADMIN_SET_PRICE = "admin_set_price";
+    private static final String CB_ADMIN_EDIT_PRICES = "admin_edit_prices";
+    private static final String CB_ADMIN_EDIT_PRICE_PREFIX = "admin_edit_price:";
     private static final String CB_CANCEL_FLOW = "cancel_flow";
+    private static final String CB_TARIFF_PREFIX = "tariff:";
+    private static final String CB_TARIFF_MENU_PREFIX = "tariff_menu:";
+    private static final String PAY_STATUS_RUNNING = "AUTOPOST_RUNNING";
+    private static final String PAY_STATUS_COMPLETED = "AUTOPOST_COMPLETED";
+    private static final String PAY_STATUS_RUNNING_TEST = "AUTOPOST_RUNNING_TEST";
+    private static final String PAY_STATUS_COMPLETED_TEST = "AUTOPOST_COMPLETED_TEST";
 
     private final BotConfig config;
     private final Database database;
+    private final ScheduledExecutorService autoPostExecutor;
 
     public StarsPostBot(BotConfig config, Database database) {
         this.config = config;
         this.database = database;
+        this.autoPostExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "autopost-scheduler");
+            t.setDaemon(true);
+            return t;
+        });
+        this.autoPostExecutor.scheduleWithFixedDelay(this::safeAutoPostTick, 20, 30, TimeUnit.SECONDS);
     }
 
     @Override
@@ -128,9 +151,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
         switch (userState.state()) {
             case WAIT_MEDIA -> handleMediaInput(message, userState);
             case WAIT_TEXT -> handleTextInput(message, userState);
+            case WAIT_TARIFF -> handleTariffHint(message, userState);
             case WAIT_GROUP_ID -> handleGroupInput(message, userId);
             case WAIT_NEW_ADMIN_ID -> handleNewAdminInput(message, userId);
-            case WAIT_POST_PRICE -> handlePostPriceInput(message, userId);
+            case WAIT_TARIFF_PRICE -> handleTariffPriceInput(message, userState, userId);
             default -> {
                 if (message.hasText() && "/admin".equalsIgnoreCase(message.getText().trim()) && database.isAdmin(userId)) {
                     sendAdminPanel(message.getChatId());
@@ -182,9 +206,13 @@ public class StarsPostBot extends TelegramLongPollingBot {
             answerCallback(query.getId(), null, false);
             return;
         }
-        if (data.startsWith("confirm:")) {
-            long draftId = parseIdSuffix(data, "confirm:");
-            confirmDraft(query, draftId);
+        if (data.startsWith(CB_TARIFF_PREFIX)) {
+            applyTariff(query, data);
+            return;
+        }
+        if (data.startsWith(CB_TARIFF_MENU_PREFIX)) {
+            long draftId = parseIdSuffix(data, CB_TARIFF_MENU_PREFIX);
+            showTariffMenu(query, draftId);
             return;
         }
         if (data.startsWith("pay:")) {
@@ -224,8 +252,12 @@ public class StarsPostBot extends TelegramLongPollingBot {
             adminToggleTestMode(query);
             return;
         }
-        if (CB_ADMIN_SET_PRICE.equals(data)) {
-            adminSetPriceMode(query);
+        if (CB_ADMIN_EDIT_PRICES.equals(data)) {
+            adminShowTariffPriceMenu(query);
+            return;
+        }
+        if (data.startsWith(CB_ADMIN_EDIT_PRICE_PREFIX)) {
+            adminSetTariffPriceMode(query, parseIdSuffix(data, CB_ADMIN_EDIT_PRICE_PREFIX));
             return;
         }
         if (data.startsWith("admin_remove:")) {
@@ -258,15 +290,16 @@ public class StarsPostBot extends TelegramLongPollingBot {
         if (answerCallback) {
             answerCallback(query.getId(), null, false);
         }
-        int postPrice = getCurrentPostPriceStars();
         boolean testMode = isTestModeEnabled();
         String modeNotice = testMode ? "\n🧪 Сейчас включён тестовый режим: списания не реальные." : "";
         sendText(chatId, """
-                📝 Создаем новый рекламный пост.
+                📝 Создаем автопост на 7 дней.
 
-                Стоимость публикации: <b>%d Stars</b>.
-                Пришлите одно фото или одно видео для поста.%s
-                """.formatted(postPrice, modeNotice), inlineKeyboard(
+                Тарифы:
+                %s
+
+                Сначала пришлите одно фото или одно видео.%s
+                """.formatted(formatTariffLinesForText(), modeNotice), inlineKeyboard(
                 row(button("❌ Отмена", CB_CANCEL_FLOW))
         ));
     }
@@ -329,19 +362,49 @@ public class StarsPostBot extends TelegramLongPollingBot {
         }
 
         database.setDraftText(draftId, text);
-        database.saveUserState(userId, ConversationState.WAIT_CONFIRM, draftId);
+        database.saveUserState(userId, ConversationState.WAIT_TARIFF, draftId);
 
         sendText(message.getChatId(), """
                 Текст сохранен ✨
-                Нажмите «Подтвердить», чтобы получить предпросмотр перед оплатой.
-                """, inlineKeyboard(
-                row(button("✅ Подтвердить", "confirm:" + draftId)),
-                row(button("🔄 Начать заново", "restart:" + draftId))
-        ));
+                Теперь выберите тариф автопостинга на 7 дней:
+                """, tariffKeyboard(draftId, true));
     }
 
-    private void confirmDraft(CallbackQuery query, long draftId) throws Exception {
+    private void handleTariffHint(Message message, UserStateData state) throws Exception {
+        Long draftId = state.draftId();
+        if (draftId == null) {
+            sendMainMenu(message.getChatId(), message.getFrom().getId());
+            return;
+        }
+        sendText(message.getChatId(), """
+                Выберите тариф кнопкой ниже:
+                """, tariffKeyboard(draftId, true));
+    }
+
+    private void applyTariff(CallbackQuery query, String callbackData) throws Exception {
         long userId = query.getFrom().getId();
+        String[] parts = callbackData.split(":");
+        if (parts.length != 3) {
+            answerCallback(query.getId(), "Некорректный тариф", true);
+            return;
+        }
+
+        int intervalHours;
+        long draftId;
+        try {
+            intervalHours = Integer.parseInt(parts[1]);
+            draftId = Long.parseLong(parts[2]);
+        } catch (NumberFormatException e) {
+            answerCallback(query.getId(), "Некорректный тариф", true);
+            return;
+        }
+
+        TariffPlan tariff = tariffByInterval(intervalHours);
+        if (tariff == null) {
+            answerCallback(query.getId(), "Тариф не найден", true);
+            return;
+        }
+
         Optional<Draft> draftOpt = database.getDraft(draftId);
         if (draftOpt.isEmpty()) {
             answerCallback(query.getId(), "Черновик не найден", true);
@@ -354,7 +417,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return;
         }
         if (draft.status() != DraftStatus.READY) {
-            answerCallback(query.getId(), "Черновик не готов к предпросмотру", true);
+            answerCallback(query.getId(), "Черновик недоступен", true);
             return;
         }
         if (draft.mediaType() == null || draft.mediaFileId() == null || draft.postText() == null || draft.postText().isBlank()) {
@@ -362,9 +425,59 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return;
         }
 
+        database.setDraftTariff(draftId, tariff.intervalHours(), tariff.priceStars());
+        database.saveUserState(userId, ConversationState.WAIT_TARIFF, draftId);
+
+        answerCallback(query.getId(), "Тариф выбран", false);
+        sendText(query.getMessage().getChatId(), """
+                ✅ Тариф: каждые %d часа(ов), 7 дней.
+                Стоимость: <b>%d Stars</b>.
+
+                Проверьте предпросмотр и нажмите «Оплатить».
+                """.formatted(tariff.intervalHours(), tariff.priceStars()), null);
+        sendPreviewMedia(userId, draft, paymentKeyboard(draftId, tariff));
+    }
+
+    private InlineKeyboardMarkup tariffKeyboard(long draftId, boolean includeRestart) {
+        TariffPlan t2 = tariffByInterval(2);
+        TariffPlan t4 = tariffByInterval(4);
+        TariffPlan t6 = tariffByInterval(6);
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+        rows.add(row(button("⏱ Каждые 2 часа — " + t2.priceStars() + " ⭐", CB_TARIFF_PREFIX + "2:" + draftId)));
+        rows.add(row(button("⏱ Каждые 4 часа — " + t4.priceStars() + " ⭐", CB_TARIFF_PREFIX + "4:" + draftId)));
+        rows.add(row(button("⏱ Каждые 6 часов — " + t6.priceStars() + " ⭐", CB_TARIFF_PREFIX + "6:" + draftId)));
+        if (includeRestart) {
+            rows.add(row(button("🔄 Начать заново", "restart:" + draftId)));
+        }
+        rows.add(row(button("❌ Отмена", CB_CANCEL_FLOW)));
+        return inlineKeyboard(rows.toArray(List[]::new));
+    }
+
+    private InlineKeyboardMarkup paymentKeyboard(long draftId, TariffPlan tariff) throws SQLException {
+        boolean testMode = isTestModeEnabled();
+        String payLabel = testMode
+                ? "🧪 Тестовая оплата (" + tariff.priceStars() + " Stars)"
+                : "💫 Оплатить " + tariff.priceStars() + " Stars";
+        return inlineKeyboard(
+                row(button(payLabel, "pay:" + draftId)),
+                row(button("🔁 Выбрать другой тариф", CB_TARIFF_MENU_PREFIX + draftId)),
+                row(button("🔄 Начать заново", "restart:" + draftId))
+        );
+    }
+
+    private void showTariffMenu(CallbackQuery query, long draftId) throws Exception {
+        long userId = query.getFrom().getId();
+        Optional<Draft> draftOpt = database.getDraft(draftId);
+        if (draftOpt.isEmpty() || draftOpt.get().userId() != userId) {
+            answerCallback(query.getId(), "Черновик не найден", true);
+            return;
+        }
+        if (draftOpt.get().status() != DraftStatus.READY) {
+            answerCallback(query.getId(), "Черновик недоступен", true);
+            return;
+        }
         answerCallback(query.getId(), null, false);
-        sendText(query.getMessage().getChatId(), "👀 Предпросмотр вашего поста:", null);
-        sendPreviewMedia(userId, draft, paymentKeyboard(draft.id()));
+        sendText(query.getMessage().getChatId(), "Выберите новый тариф:", tariffKeyboard(draftId, false));
     }
 
     private void sendInvoice(CallbackQuery query, long draftId) throws Exception {
@@ -379,18 +492,23 @@ public class StarsPostBot extends TelegramLongPollingBot {
             answerCallback(query.getId(), "Это не ваш черновик", true);
             return;
         }
-        if (draft.status() == DraftStatus.PAID || draft.status() == DraftStatus.PUBLISHED) {
-            answerCallback(query.getId(), "Этот черновик уже оплачен", true);
+        if (draft.status() == DraftStatus.PAID || draft.status() == DraftStatus.ACTIVE || draft.status() == DraftStatus.PUBLISHED || draft.status() == DraftStatus.COMPLETED) {
+            answerCallback(query.getId(), "Кампания уже оплачена", true);
             return;
         }
         if (database.getTargetGroupId().isEmpty()) {
             answerCallback(query.getId(), "Группа не настроена администратором", true);
             return;
         }
-        int postPrice = getCurrentPostPriceStars();
+        TariffPlan tariff = tariffFromDraft(draft);
+        if (tariff == null) {
+            answerCallback(query.getId(), "Сначала выберите тариф", true);
+            return;
+        }
+        int postPrice = tariff.priceStars();
         if (isTestModeEnabled()) {
             answerCallback(query.getId(), "Тестовая оплата выполнена", false);
-            simulatePayment(query, draft, postPrice);
+            simulatePayment(query, draft, tariff);
             return;
         }
 
@@ -408,14 +526,14 @@ public class StarsPostBot extends TelegramLongPollingBot {
         answerCallback(query.getId(), "Счёт отправлен", false);
     }
 
-    private void simulatePayment(CallbackQuery query, Draft draft, int amount) throws Exception {
+    private void simulatePayment(CallbackQuery query, Draft draft, TariffPlan tariff) throws Exception {
         long userId = query.getFrom().getId();
         completePaidDraft(
                 draft,
                 userId,
                 query.getMessage().getChatId(),
                 query.getFrom().getUserName(),
-                amount,
+                tariff.priceStars(),
                 CURRENCY_STARS,
                 "TEST-" + draft.id() + "-" + System.currentTimeMillis(),
                 "TEST",
@@ -461,6 +579,13 @@ public class StarsPostBot extends TelegramLongPollingBot {
         if (draft.status() != DraftStatus.READY) {
             return "Этот черновик уже недоступен для оплаты.";
         }
+        TariffPlan tariff = tariffFromDraft(draft);
+        if (tariff == null) {
+            return "Не выбран тариф.";
+        }
+        if (payload.amount() > 0 && payload.amount() != tariff.priceStars()) {
+            return "Тариф и сумма не совпадают.";
+        }
         if (database.getTargetGroupId().isEmpty()) {
             return "Группа для публикации не настроена.";
         }
@@ -490,11 +615,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
             sendText(message.getChatId(), "Оплата получена, но доступ к черновику ограничен.", mainMenuKeyboard(database.isAdmin(userId)));
             return;
         }
-        if (draft.status() == DraftStatus.PUBLISHED) {
-            sendText(message.getChatId(), "Этот пост уже был опубликован ранее.", inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
+        if (draft.status() == DraftStatus.ACTIVE || draft.status() == DraftStatus.COMPLETED || draft.status() == DraftStatus.PUBLISHED) {
+            sendText(message.getChatId(), "Этот черновик уже оплачен ранее.", inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
             return;
         }
-        if (draft.status() != DraftStatus.READY && draft.status() != DraftStatus.PAID) {
+        if (draft.status() != DraftStatus.READY) {
             sendText(message.getChatId(), "Этот черновик уже недоступен для оплаты.", inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
             return;
         }
@@ -525,6 +650,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
             String paidStatus,
             boolean simulated
     ) throws Exception {
+        TariffPlan tariff = tariffFromDraft(draft);
+        if (tariff == null) {
+            sendText(chatId, "Не выбран тариф для автопостинга.", inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
+            return;
+        }
         database.upsertPayment(
                 draft.id(),
                 userId,
@@ -535,7 +665,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 providerPaymentChargeId,
                 paidStatus
         );
-        database.setDraftStatus(draft.id(), DraftStatus.PAID);
 
         Optional<Long> groupIdOpt = database.getTargetGroupId();
         if (groupIdOpt.isEmpty()) {
@@ -546,31 +675,100 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return;
         }
 
-        boolean published = publishDraftToGroup(groupIdOpt.get(), draft);
-        if (published) {
-            database.setDraftStatus(draft.id(), DraftStatus.PUBLISHED);
-            database.updatePaymentStatusByDraft(draft.id(), simulated ? "PUBLISHED_TEST" : "PUBLISHED");
-            database.clearUserState(userId);
+        Integer firstMessageId = publishDraftToGroupAndGetMessageId(groupIdOpt.get(), draft);
+        if (firstMessageId == null) {
+            database.updatePaymentStatusByDraft(draft.id(), simulated ? "AUTOPOST_START_FAILED_TEST" : "AUTOPOST_START_FAILED");
             sendText(chatId, """
                     %s
-                    Спасибо за размещение и доверие.
-                    """.formatted(simulated ? "🧪 Тест завершён: пост опубликован." : "🎉 Готово! Пост уже опубликован."), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
-        } else {
-            database.updatePaymentStatusByDraft(draft.id(), simulated ? "PAID_TEST_NOT_PUBLISHED" : "PAID_NOT_PUBLISHED");
-            sendText(chatId, """
-                    %s
-                    Публикация временно не удалась. Администратор уже может проверить это в панели.
-                    """.formatted(simulated ? "Тестовая оплата выполнена ✅" : "Оплата получена ✅"), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
+                    Не удалось сделать первый пост в группе. Проверьте права бота и настройки группы.
+                    """.formatted(simulated ? "Тестовая оплата подтверждена." : "Оплата подтверждена."), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
+            return;
         }
+
+        Instant now = Instant.now();
+        Instant nextPublishAt = now.plus(Duration.ofHours(tariff.intervalHours()));
+        Instant publishUntil = now.plus(CAMPAIGN_DURATION);
+        database.activateAutoPosting(draft.id(), nextPublishAt.toString(), publishUntil.toString(), firstMessageId, 1);
+        database.updatePaymentStatusByDraft(draft.id(), simulated ? PAY_STATUS_RUNNING_TEST : PAY_STATUS_RUNNING);
+        database.clearUserState(userId);
+        sendText(chatId, """
+                %s
+                🚀 Кампания автопостинга на 7 дней запущена.
+                Публикация: каждые <b>%d часа(ов)</b>.
+                Спасибо за оплату!
+                """.formatted(simulated ? "🧪 Тестовая оплата подтверждена." : "✅ Оплата подтверждена.", tariff.intervalHours()), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
     }
 
     private boolean publishDraftToGroup(long groupId, Draft draft) {
+        return publishDraftToGroupAndGetMessageId(groupId, draft) != null;
+    }
+
+    private Integer publishDraftToGroupAndGetMessageId(long groupId, Draft draft) {
         try {
-            sendPreviewMedia(groupId, draft, null);
-            return true;
+            return sendPreviewMedia(groupId, draft, null).getMessageId();
         } catch (TelegramApiException e) {
             log.error("Failed to publish draft {}", draft.id(), e);
-            return false;
+            return null;
+        }
+    }
+
+    private void safeAutoPostTick() {
+        try {
+            processAutoPostTick();
+        } catch (Exception e) {
+            log.error("Auto-post scheduler failed", e);
+        }
+    }
+
+    private void processAutoPostTick() throws Exception {
+        Optional<Long> groupIdOpt = database.getTargetGroupId();
+        if (groupIdOpt.isEmpty()) {
+            return;
+        }
+
+        Instant now = Instant.now();
+        List<AutoPostJob> jobs = database.listDueAutoPostJobs(now.toString(), 20);
+        for (AutoPostJob job : jobs) {
+            Instant publishUntil = parseInstant(job.publishUntil());
+            if (publishUntil == null || !now.isBefore(publishUntil)) {
+                database.completeAutoPosting(job.draftId(), job.lastGroupMessageId(), job.publishCount());
+                database.updatePaymentStatusByDraft(job.draftId(), mapCompletedStatus(job.draftId()));
+                continue;
+            }
+
+            if (job.lastGroupMessageId() != null) {
+                deleteGroupMessageSilently(groupIdOpt.get(), job.lastGroupMessageId());
+            }
+
+            Draft draft = new Draft(
+                    job.draftId(),
+                    job.userId(),
+                    job.mediaType(),
+                    job.mediaFileId(),
+                    job.postText(),
+                    DraftStatus.ACTIVE,
+                    job.tariffIntervalHours(),
+                    null,
+                    job.nextPublishAt(),
+                    job.publishUntil(),
+                    job.publishCount(),
+                    job.lastGroupMessageId()
+            );
+
+            Integer postedMessageId = publishDraftToGroupAndGetMessageId(groupIdOpt.get(), draft);
+            if (postedMessageId == null) {
+                database.markAutoPostFailureRetry(job.draftId(), now.plus(FAILED_RETRY_DELAY).toString());
+                continue;
+            }
+
+            int newCount = job.publishCount() + 1;
+            Instant nextPublish = now.plus(Duration.ofHours(job.tariffIntervalHours()));
+            if (!nextPublish.isBefore(publishUntil)) {
+                database.completeAutoPosting(job.draftId(), postedMessageId, newCount);
+                database.updatePaymentStatusByDraft(job.draftId(), mapCompletedStatus(job.draftId()));
+            } else {
+                database.markAutoPostSuccess(job.draftId(), nextPublish.toString(), newCount, postedMessageId);
+            }
         }
     }
 
@@ -622,43 +820,75 @@ public class StarsPostBot extends TelegramLongPollingBot {
         sendAdminPanel(query.getMessage().getChatId());
     }
 
-    private void adminSetPriceMode(CallbackQuery query) throws Exception {
+    private void adminShowTariffPriceMenu(CallbackQuery query) throws Exception {
+        long userId = query.getFrom().getId();
+        if (!database.isAdmin(userId)) {
+            answerCallback(query.getId(), "Недостаточно прав", true);
+            return;
+        }
+        answerCallback(query.getId(), null, false);
+        sendText(query.getMessage().getChatId(), """
+                💰 <b>Настройка тарифов</b>
+                Выберите тариф для изменения цены:
+                """, tariffPriceAdminKeyboard());
+    }
+
+    private void adminSetTariffPriceMode(CallbackQuery query, long intervalHoursRaw) throws Exception {
         long userId = query.getFrom().getId();
         if (!database.isAdmin(userId)) {
             answerCallback(query.getId(), "Недостаточно прав", true);
             return;
         }
 
-        int currentPrice = getCurrentPostPriceStars();
-        database.saveUserState(userId, ConversationState.WAIT_POST_PRICE, null);
+        int intervalHours = (int) intervalHoursRaw;
+        TariffPlan tariff = tariffByInterval(intervalHours);
+        if (tariff == null) {
+            answerCallback(query.getId(), "Неизвестный тариф", true);
+            return;
+        }
+
+        database.saveUserState(userId, ConversationState.WAIT_TARIFF_PRICE, Long.valueOf(intervalHours));
         answerCallback(query.getId(), null, false);
         sendText(query.getMessage().getChatId(), """
-                💰 Отправьте новую стоимость поста в Stars.
-                Сейчас: <b>%d Stars</b>
-                Пример: <code>150</code>
-                """.formatted(currentPrice), inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
+                Введите новую цену для тарифа «каждые %d часа(ов)».
+                Текущая цена: <b>%d Stars</b>
+                """.formatted(intervalHours, tariff.priceStars()), inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
     }
 
-    private void handlePostPriceInput(Message message, long userId) throws Exception {
+    private void handleTariffPriceInput(Message message, UserStateData state, long userId) throws Exception {
         if (!database.isAdmin(userId)) {
             database.clearUserState(userId);
             sendMainMenu(message.getChatId(), userId);
             return;
         }
         if (!message.hasText()) {
-            sendText(message.getChatId(), "Нужна стоимость числом (например 150).", inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
+            sendText(message.getChatId(), "Нужна цена числом.", inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
+            return;
+        }
+
+        Long intervalRaw = state.draftId();
+        if (intervalRaw == null) {
+            database.clearUserState(userId);
+            sendAdminPanel(message.getChatId());
+            return;
+        }
+
+        int intervalHours = intervalRaw.intValue();
+        if (tariffByInterval(intervalHours) == null) {
+            database.clearUserState(userId);
+            sendAdminPanel(message.getChatId());
             return;
         }
 
         Long price = parseLongFromText(message.getText());
-        if (price == null || price <= 0 || price > 25000) {
-            sendText(message.getChatId(), "Введите корректную сумму от 1 до 25000 Stars.", inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
+        if (price == null || price <= 0 || price > 50000) {
+            sendText(message.getChatId(), "Введите корректную цену от 1 до 50000 Stars.", inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
             return;
         }
 
-        database.setPostPriceStars(price.intValue());
+        database.setTariffPrice(intervalHours, price.intValue());
         database.clearUserState(userId);
-        sendText(message.getChatId(), "✅ Стоимость обновлена: <b>" + price + " Stars</b>", inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
+        sendText(message.getChatId(), "✅ Цена тарифа обновлена: каждые " + intervalHours + " часа(ов) — <b>" + price + " Stars</b>", inlineKeyboard(row(button("⬅️ В админ-панель", CB_ADMIN_BACK))));
     }
 
     private void adminShowLastPayments(CallbackQuery query) throws Exception {
@@ -799,16 +1029,19 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private void adminShowPanelText(long chatId) throws Exception {
         Optional<Long> groupId = database.getTargetGroupId();
         String groupValue = groupId.map(String::valueOf).orElse("не задана");
-        int currentPrice = getCurrentPostPriceStars();
         boolean testMode = isTestModeEnabled();
+        TariffPlan t2 = tariffByInterval(2);
+        TariffPlan t4 = tariffByInterval(4);
+        TariffPlan t6 = tariffByInterval(6);
         sendText(chatId, """
                 🛠 <b>Админ-панель</b>
 
                 📌 Группа: <code>%s</code>
-                💰 Стоимость поста: <b>%d Stars</b>
                 🧪 Тестовый режим: <b>%s</b>
+                📅 Автопостинг: <b>7 дней</b>
+                💰 Тарифы: 2ч=%d ⭐ | 4ч=%d ⭐ | 6ч=%d ⭐
                 Управляйте настройками и модерацией через кнопки ниже.
-                """.formatted(groupValue, currentPrice, testMode ? "ВКЛ" : "ВЫКЛ"), adminPanelKeyboard(testMode));
+                """.formatted(groupValue, testMode ? "ВКЛ" : "ВЫКЛ", t2.priceStars(), t4.priceStars(), t6.priceStars()), adminPanelKeyboard(testMode));
     }
 
     private void sendAdminPanel(long chatId) throws Exception {
@@ -834,13 +1067,18 @@ public class StarsPostBot extends TelegramLongPollingBot {
 
     private void sendMainMenu(long chatId, long userId) throws Exception {
         boolean isAdmin = database.isAdmin(userId);
-        int postPrice = getCurrentPostPriceStars();
+        TariffPlan t2 = tariffByInterval(2);
+        TariffPlan t4 = tariffByInterval(4);
+        TariffPlan t6 = tariffByInterval(6);
         sendText(chatId, """
                 👋 Добро пожаловать!
 
-                Здесь можно быстро разместить рекламный пост в группе.
-                Стоимость одного размещения: <b>%d Stars</b>.
-                """.formatted(postPrice), mainMenuKeyboard(isAdmin));
+                Здесь можно запустить автопостинг рекламы на 7 дней.
+                Тарифы:
+                • каждые 2 часа — %d ⭐
+                • каждые 4 часа — %d ⭐
+                • каждые 6 часов — %d ⭐
+                """.formatted(t2.priceStars(), t4.priceStars(), t6.priceStars()), mainMenuKeyboard(isAdmin));
     }
 
     private InlineKeyboardMarkup mainMenuKeyboard(boolean isAdmin) {
@@ -852,23 +1090,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
         return inlineKeyboard(rows.toArray(List[]::new));
     }
 
-    private InlineKeyboardMarkup paymentKeyboard(long draftId) throws SQLException {
-        int postPrice = getCurrentPostPriceStars();
-        boolean testMode = isTestModeEnabled();
-        String payLabel = testMode
-                ? "🧪 Тестовая оплата (" + postPrice + " Stars)"
-                : "💫 Оплатить " + postPrice + " Stars";
-        return inlineKeyboard(
-                row(button(payLabel, "pay:" + draftId)),
-                row(button("🔄 Новый черновик", "restart:" + draftId))
-        );
-    }
-
     private InlineKeyboardMarkup adminPanelKeyboard(boolean testMode) {
         String toggleLabel = testMode ? "🧪 Выключить тестовый режим" : "🧪 Включить тестовый режим";
         return inlineKeyboard(
                 row(button("📌 Задать группу", CB_ADMIN_SET_GROUP)),
-                row(button("💰 Изменить цену поста", CB_ADMIN_SET_PRICE)),
+                row(button("💰 Изменить цены тарифов", CB_ADMIN_EDIT_PRICES)),
                 row(button(toggleLabel, CB_ADMIN_TOGGLE_TEST_MODE)),
                 row(button("💳 Последние оплаты", CB_ADMIN_LAST_PAYMENTS)),
                 row(button("👮 Список админов", CB_ADMIN_LIST_ADMINS)),
@@ -878,15 +1104,26 @@ public class StarsPostBot extends TelegramLongPollingBot {
         );
     }
 
-    private void sendPreviewMedia(long chatId, Draft draft, InlineKeyboardMarkup markup) throws TelegramApiException {
+    private InlineKeyboardMarkup tariffPriceAdminKeyboard() {
+        TariffPlan t2 = tariffByInterval(2);
+        TariffPlan t4 = tariffByInterval(4);
+        TariffPlan t6 = tariffByInterval(6);
+        return inlineKeyboard(
+                row(button("2ч → " + t2.priceStars() + " ⭐", CB_ADMIN_EDIT_PRICE_PREFIX + "2")),
+                row(button("4ч → " + t4.priceStars() + " ⭐", CB_ADMIN_EDIT_PRICE_PREFIX + "4")),
+                row(button("6ч → " + t6.priceStars() + " ⭐", CB_ADMIN_EDIT_PRICE_PREFIX + "6")),
+                row(button("⬅️ В админ-панель", CB_ADMIN_BACK))
+        );
+    }
+
+    private Message sendPreviewMedia(long chatId, Draft draft, InlineKeyboardMarkup markup) throws TelegramApiException {
         if (draft.mediaType() == MediaType.PHOTO) {
             SendPhoto sendPhoto = new SendPhoto();
             sendPhoto.setChatId(String.valueOf(chatId));
             sendPhoto.setPhoto(new InputFile(draft.mediaFileId()));
             sendPhoto.setCaption(draft.postText());
             sendPhoto.setReplyMarkup(markup);
-            execute(sendPhoto);
-            return;
+            return execute(sendPhoto);
         }
         if (draft.mediaType() == MediaType.VIDEO) {
             SendVideo sendVideo = new SendVideo();
@@ -894,7 +1131,19 @@ public class StarsPostBot extends TelegramLongPollingBot {
             sendVideo.setVideo(new InputFile(draft.mediaFileId()));
             sendVideo.setCaption(draft.postText());
             sendVideo.setReplyMarkup(markup);
-            execute(sendVideo);
+            return execute(sendVideo);
+        }
+        throw new TelegramApiException("Unsupported media type");
+    }
+
+    private void deleteGroupMessageSilently(long groupId, int messageId) {
+        try {
+            DeleteMessage delete = new DeleteMessage();
+            delete.setChatId(String.valueOf(groupId));
+            delete.setMessageId(messageId);
+            execute(delete);
+        } catch (TelegramApiException e) {
+            log.warn("Failed to delete old group message {} in {}", messageId, groupId, e);
         }
     }
 
@@ -997,24 +1246,84 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private String statusBadge(String status) {
         return switch (status) {
             case "PAID" -> "🟡 Оплачено";
-            case "PUBLISHED" -> "✅ Опубликовано";
-            case "PAID_NOT_PUBLISHED" -> "⚠️ Оплачено, не опубликовано";
+            case PAY_STATUS_RUNNING -> "🟢 Автопостинг активен";
+            case PAY_STATUS_COMPLETED -> "✅ Кампания завершена";
             case "PAID_TEST" -> "🧪 Тест: оплачено";
-            case "PUBLISHED_TEST" -> "🧪 Тест: опубликовано";
-            case "PAID_TEST_NOT_PUBLISHED" -> "🧪 Тест: не опубликовано";
+            case PAY_STATUS_RUNNING_TEST -> "🧪 Тест: автопостинг активен";
+            case PAY_STATUS_COMPLETED_TEST -> "🧪 Тест: кампания завершена";
             default -> "ℹ️ " + status;
         };
-    }
-
-    private int getCurrentPostPriceStars() throws SQLException {
-        return database.getPostPriceStars(config.postPriceStars());
     }
 
     private boolean isTestModeEnabled() throws SQLException {
         return database.getTestMode(config.testMode());
     }
 
+    private TariffPlan tariffFromDraft(Draft draft) {
+        if (draft.tariffIntervalHours() == null || draft.tariffPriceStars() == null) {
+            return null;
+        }
+        TariffPlan tariff = tariffByInterval(draft.tariffIntervalHours());
+        if (tariff == null || tariff.priceStars() != draft.tariffPriceStars()) {
+            return new TariffPlan(draft.tariffIntervalHours(), draft.tariffPriceStars());
+        }
+        return tariff;
+    }
+
+    private TariffPlan tariffByInterval(int intervalHours) {
+        if (intervalHours != 2 && intervalHours != 4 && intervalHours != 6) {
+            return null;
+        }
+        try {
+            int fallback = defaultTariffPrice(intervalHours);
+            int price = database.getTariffPrice(intervalHours, fallback);
+            return new TariffPlan(intervalHours, price);
+        } catch (SQLException e) {
+            log.warn("Failed to load tariff {}h price, fallback will be used", intervalHours, e);
+            return new TariffPlan(intervalHours, defaultTariffPrice(intervalHours));
+        }
+    }
+
+    private int defaultTariffPrice(int intervalHours) {
+        return switch (intervalHours) {
+            case 2 -> 1000;
+            case 4 -> 700;
+            case 6 -> 500;
+            default -> throw new IllegalArgumentException("Unsupported tariff interval: " + intervalHours);
+        };
+    }
+
+    private String formatTariffLinesForText() {
+        TariffPlan t2 = tariffByInterval(2);
+        TariffPlan t4 = tariffByInterval(4);
+        TariffPlan t6 = tariffByInterval(6);
+        return """
+                • Каждые 2 часа — <b>%d Stars</b>
+                • Каждые 4 часа — <b>%d Stars</b>
+                • Каждые 6 часов — <b>%d Stars</b>
+                """.formatted(t2.priceStars(), t4.priceStars(), t6.priceStars()).trim();
+    }
+
+    private Instant parseInstant(String value) {
+        try {
+            return value == null ? null : Instant.parse(value);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String mapCompletedStatus(long draftId) throws SQLException {
+        Optional<String> current = database.getPaymentStatusByDraft(draftId);
+        if (current.isPresent() && PAY_STATUS_RUNNING_TEST.equals(current.get())) {
+            return PAY_STATUS_COMPLETED_TEST;
+        }
+        return PAY_STATUS_COMPLETED;
+    }
+
     private record InvoicePayload(long draftId, int amount) {
+    }
+
+    private record TariffPlan(int intervalHours, int priceStars) {
     }
 
     private String formatTime(String isoInstant) {

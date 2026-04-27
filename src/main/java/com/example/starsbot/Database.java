@@ -1,6 +1,7 @@
 package com.example.starsbot;
 
 import com.example.starsbot.model.AdminInfo;
+import com.example.starsbot.model.AutoPostJob;
 import com.example.starsbot.model.ConversationState;
 import com.example.starsbot.model.Draft;
 import com.example.starsbot.model.DraftStatus;
@@ -25,6 +26,9 @@ public class Database {
     private static final String TARGET_GROUP_KEY = "target_group_id";
     private static final String TEST_MODE_KEY = "test_mode";
     private static final String POST_PRICE_STARS_KEY = "post_price_stars";
+    private static final String TARIFF_2H_KEY = "tariff_2h_price_stars";
+    private static final String TARIFF_4H_KEY = "tariff_4h_price_stars";
+    private static final String TARIFF_6H_KEY = "tariff_6h_price_stars";
     private final String jdbcUrl;
 
     public Database(String dbPath) {
@@ -74,6 +78,12 @@ public class Database {
                             updated_at TEXT NOT NULL
                         )
                         """);
+                addDraftColumnIfMissing(st, "tariff_interval_hours INTEGER");
+                addDraftColumnIfMissing(st, "tariff_price_stars INTEGER");
+                addDraftColumnIfMissing(st, "next_publish_at TEXT");
+                addDraftColumnIfMissing(st, "publish_until TEXT");
+                addDraftColumnIfMissing(st, "publish_count INTEGER NOT NULL DEFAULT 0");
+                addDraftColumnIfMissing(st, "last_group_message_id INTEGER");
                 st.execute("""
                         CREATE TABLE IF NOT EXISTS payments (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +109,9 @@ public class Database {
     public synchronized void ensureRuntimeDefaults(boolean defaultTestMode, int defaultPostPriceStars) throws SQLException {
         upsertSettingIfAbsent(TEST_MODE_KEY, Boolean.toString(defaultTestMode));
         upsertSettingIfAbsent(POST_PRICE_STARS_KEY, Integer.toString(defaultPostPriceStars));
+        upsertSettingIfAbsent(TARIFF_2H_KEY, "1000");
+        upsertSettingIfAbsent(TARIFF_4H_KEY, "700");
+        upsertSettingIfAbsent(TARIFF_6H_KEY, "500");
     }
 
     public synchronized boolean isAdmin(long userId) throws SQLException {
@@ -225,6 +238,26 @@ public class Database {
         upsertSetting(POST_PRICE_STARS_KEY, Integer.toString(stars));
     }
 
+    public synchronized int getTariffPrice(int intervalHours, int fallback) throws SQLException {
+        Optional<String> raw = getSetting(tariffKey(intervalHours));
+        if (raw.isEmpty()) {
+            return fallback;
+        }
+        try {
+            int value = Integer.parseInt(raw.get());
+            return value > 0 ? value : fallback;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    public synchronized void setTariffPrice(int intervalHours, int stars) throws SQLException {
+        if (stars <= 0) {
+            throw new IllegalArgumentException("Price must be positive");
+        }
+        upsertSetting(tariffKey(intervalHours), Integer.toString(stars));
+    }
+
     public synchronized UserStateData getUserState(long userId) throws SQLException {
         String sql = "SELECT state, draft_id FROM user_states WHERE user_id = ?";
         try (Connection conn = open();
@@ -299,7 +332,9 @@ public class Database {
 
     public synchronized Optional<Draft> getDraft(long draftId) throws SQLException {
         String sql = """
-                SELECT id, user_id, media_type, media_file_id, post_text, status
+                SELECT id, user_id, media_type, media_file_id, post_text, status,
+                       tariff_interval_hours, tariff_price_stars, next_publish_at, publish_until, publish_count,
+                       last_group_message_id
                 FROM drafts
                 WHERE id = ?
                 """;
@@ -313,13 +348,21 @@ public class Database {
                 String mediaTypeRaw = rs.getString("media_type");
                 MediaType mediaType = mediaTypeRaw == null ? null : MediaType.valueOf(mediaTypeRaw);
                 DraftStatus status = DraftStatus.valueOf(rs.getString("status"));
+                Integer tariffIntervalHours = getNullableInt(rs, "tariff_interval_hours");
+                Integer tariffPriceStars = getNullableInt(rs, "tariff_price_stars");
                 return Optional.of(new Draft(
                         rs.getLong("id"),
                         rs.getLong("user_id"),
                         mediaType,
                         rs.getString("media_file_id"),
                         rs.getString("post_text"),
-                        status
+                        status,
+                        tariffIntervalHours,
+                        tariffPriceStars,
+                        rs.getString("next_publish_at"),
+                        rs.getString("publish_until"),
+                        rs.getInt("publish_count"),
+                        getNullableInt(rs, "last_group_message_id")
                 ));
             }
         }
@@ -368,6 +411,154 @@ public class Database {
             ps.setString(1, status.name());
             ps.setString(2, now());
             ps.setLong(3, draftId);
+            ps.executeUpdate();
+        }
+    }
+
+    public synchronized void setDraftTariff(long draftId, int intervalHours, int priceStars) throws SQLException {
+        String sql = """
+                UPDATE drafts
+                SET tariff_interval_hours = ?, tariff_price_stars = ?, updated_at = ?
+                WHERE id = ?
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, intervalHours);
+            ps.setInt(2, priceStars);
+            ps.setString(3, now());
+            ps.setLong(4, draftId);
+            ps.executeUpdate();
+        }
+    }
+
+    public synchronized void activateAutoPosting(
+            long draftId,
+            String firstPublishAt,
+            String publishUntil,
+            Integer lastGroupMessageId,
+            int publishCount
+    ) throws SQLException {
+        String sql = """
+                UPDATE drafts
+                SET status = ?, next_publish_at = ?, publish_until = ?, publish_count = ?, last_group_message_id = ?, updated_at = ?
+                WHERE id = ?
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, DraftStatus.ACTIVE.name());
+            ps.setString(2, firstPublishAt);
+            ps.setString(3, publishUntil);
+            ps.setInt(4, publishCount);
+            if (lastGroupMessageId == null) {
+                ps.setNull(5, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(5, lastGroupMessageId);
+            }
+            ps.setString(6, now());
+            ps.setLong(7, draftId);
+            ps.executeUpdate();
+        }
+    }
+
+    public synchronized List<AutoPostJob> listDueAutoPostJobs(String nowIso, int limit) throws SQLException {
+        String sql = """
+                SELECT id, user_id, media_type, media_file_id, post_text,
+                       tariff_interval_hours, next_publish_at, publish_until, publish_count, last_group_message_id
+                FROM drafts
+                WHERE status = ?
+                  AND next_publish_at IS NOT NULL
+                  AND publish_until IS NOT NULL
+                  AND next_publish_at <= ?
+                ORDER BY next_publish_at ASC
+                LIMIT ?
+                """;
+        List<AutoPostJob> jobs = new ArrayList<>();
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, DraftStatus.ACTIVE.name());
+            ps.setString(2, nowIso);
+            ps.setInt(3, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String mediaTypeRaw = rs.getString("media_type");
+                    MediaType mediaType = mediaTypeRaw == null ? null : MediaType.valueOf(mediaTypeRaw);
+                    Integer intervalHours = getNullableInt(rs, "tariff_interval_hours");
+                    if (mediaType == null || intervalHours == null || intervalHours <= 0) {
+                        continue;
+                    }
+                    jobs.add(new AutoPostJob(
+                            rs.getLong("id"),
+                            rs.getLong("user_id"),
+                            mediaType,
+                            rs.getString("media_file_id"),
+                            rs.getString("post_text"),
+                            intervalHours,
+                            rs.getString("next_publish_at"),
+                            rs.getString("publish_until"),
+                            rs.getInt("publish_count"),
+                            getNullableInt(rs, "last_group_message_id")
+                    ));
+                }
+            }
+        }
+        return jobs;
+    }
+
+    public synchronized void completeAutoPosting(long draftId, Integer lastGroupMessageId, int publishCount) throws SQLException {
+        String sql = """
+                UPDATE drafts
+                SET status = ?, next_publish_at = NULL, publish_count = ?, last_group_message_id = ?, updated_at = ?
+                WHERE id = ?
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, DraftStatus.COMPLETED.name());
+            ps.setInt(2, publishCount);
+            if (lastGroupMessageId == null) {
+                ps.setNull(3, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(3, lastGroupMessageId);
+            }
+            ps.setString(4, now());
+            ps.setLong(5, draftId);
+            ps.executeUpdate();
+        }
+    }
+
+    public synchronized void markAutoPostSuccess(long draftId, String nextPublishAt, int newPublishCount, Integer lastGroupMessageId) throws SQLException {
+        String sql = """
+                UPDATE drafts
+                SET next_publish_at = ?, publish_count = ?, last_group_message_id = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, nextPublishAt);
+            ps.setInt(2, newPublishCount);
+            if (lastGroupMessageId == null) {
+                ps.setNull(3, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(3, lastGroupMessageId);
+            }
+            ps.setString(4, now());
+            ps.setLong(5, draftId);
+            ps.setString(6, DraftStatus.ACTIVE.name());
+            ps.executeUpdate();
+        }
+    }
+
+    public synchronized void markAutoPostFailureRetry(long draftId, String retryAt) throws SQLException {
+        String sql = """
+                UPDATE drafts
+                SET next_publish_at = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, retryAt);
+            ps.setString(2, now());
+            ps.setLong(3, draftId);
+            ps.setString(4, DraftStatus.ACTIVE.name());
             ps.executeUpdate();
         }
     }
@@ -421,6 +612,20 @@ public class Database {
             ps.setLong(2, draftId);
             ps.executeUpdate();
         }
+    }
+
+    public synchronized Optional<String> getPaymentStatusByDraft(long draftId) throws SQLException {
+        String sql = "SELECT status FROM payments WHERE draft_id = ?";
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, draftId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Optional.ofNullable(rs.getString("status"));
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     public synchronized List<PaymentInfo> listRecentPayments(int limit) throws SQLException {
@@ -496,6 +701,31 @@ public class Database {
             }
         }
         return Optional.empty();
+    }
+
+    private void addDraftColumnIfMissing(Statement st, String definition) throws SQLException {
+        try {
+            st.execute("ALTER TABLE drafts ADD COLUMN " + definition);
+        } catch (SQLException e) {
+            String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+            if (!msg.contains("duplicate column name")) {
+                throw e;
+            }
+        }
+    }
+
+    private Integer getNullableInt(ResultSet rs, String column) throws SQLException {
+        int value = rs.getInt(column);
+        return rs.wasNull() ? null : value;
+    }
+
+    private String tariffKey(int intervalHours) {
+        return switch (intervalHours) {
+            case 2 -> TARIFF_2H_KEY;
+            case 4 -> TARIFF_4H_KEY;
+            case 6 -> TARIFF_6H_KEY;
+            default -> throw new IllegalArgumentException("Unsupported tariff interval: " + intervalHours);
+        };
     }
 
     private ConversationState parseState(String raw) {

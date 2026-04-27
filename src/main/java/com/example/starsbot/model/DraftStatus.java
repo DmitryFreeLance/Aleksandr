@@ -4,7 +4,8 @@ public enum DraftStatus {
     DRAFT,
     READY,
     PAID,
+    ACTIVE,
     PUBLISHED,
+    COMPLETED,
     CANCELLED
 }
-

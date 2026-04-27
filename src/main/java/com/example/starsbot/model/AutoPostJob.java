@@ -1,14 +1,12 @@
 package com.example.starsbot.model;
 
-public record Draft(
-        long id,
+public record AutoPostJob(
+        long draftId,
         long userId,
         MediaType mediaType,
         String mediaFileId,
         String postText,
-        DraftStatus status,
-        Integer tariffIntervalHours,
-        Integer tariffPriceStars,
+        int tariffIntervalHours,
         String nextPublishAt,
         String publishUntil,
         int publishCount,
