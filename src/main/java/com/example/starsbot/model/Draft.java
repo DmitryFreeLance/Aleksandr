@@ -12,6 +12,7 @@ public record Draft(
         String nextPublishAt,
         String publishUntil,
         int publishCount,
-        Integer lastGroupMessageId
+        Integer lastGroupMessageId,
+        Integer lastGroupMediaCount
 ) {
 }

@@ -4,6 +4,7 @@ import com.example.starsbot.model.AdminInfo;
 import com.example.starsbot.model.AutoPostJob;
 import com.example.starsbot.model.ConversationState;
 import com.example.starsbot.model.Draft;
+import com.example.starsbot.model.DraftMedia;
 import com.example.starsbot.model.DraftStatus;
 import com.example.starsbot.model.MediaType;
 import com.example.starsbot.model.PaymentInfo;
@@ -14,6 +15,7 @@ import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.AnswerPreCheckoutQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.send.SendMediaGroup;
 import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
@@ -23,6 +25,9 @@ import org.telegram.telegrambots.meta.api.objects.Message;
 import org.telegram.telegrambots.meta.api.objects.PhotoSize;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.User;
+import org.telegram.telegrambots.meta.api.objects.media.InputMedia;
+import org.telegram.telegrambots.meta.api.objects.media.InputMediaPhoto;
+import org.telegram.telegrambots.meta.api.objects.media.InputMediaVideo;
 import org.telegram.telegrambots.meta.api.objects.payments.LabeledPrice;
 import org.telegram.telegrambots.meta.api.objects.payments.PreCheckoutQuery;
 import org.telegram.telegrambots.meta.api.objects.payments.SuccessfulPayment;
@@ -37,9 +42,12 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -65,9 +73,14 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String CB_ADMIN_TOGGLE_TEST_MODE = "admin_toggle_test_mode";
     private static final String CB_ADMIN_EDIT_PRICES = "admin_edit_prices";
     private static final String CB_ADMIN_EDIT_PRICE_PREFIX = "admin_edit_price:";
+    private static final String CB_MY_POSTS = "my_posts";
+    private static final String CB_EDIT_POST_PREFIX = "edit_post:";
+    private static final String CB_EDIT_POST_START_PREFIX = "edit_post_start:";
+    private static final String CB_MEDIA_DONE_PREFIX = "media_done:";
     private static final String CB_CANCEL_FLOW = "cancel_flow";
     private static final String CB_TARIFF_PREFIX = "tariff:";
     private static final String CB_TARIFF_MENU_PREFIX = "tariff_menu:";
+    private static final int MAX_MEDIA_ITEMS = 9;
     private static final String PAY_STATUS_RUNNING = "AUTOPOST_RUNNING";
     private static final String PAY_STATUS_COMPLETED = "AUTOPOST_COMPLETED";
     private static final String PAY_STATUS_RUNNING_TEST = "AUTOPOST_RUNNING_TEST";
@@ -76,10 +89,12 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private final BotConfig config;
     private final Database database;
     private final ScheduledExecutorService autoPostExecutor;
+    private final Map<Long, List<PendingMediaItem>> editMediaBuffers;
 
     public StarsPostBot(BotConfig config, Database database) {
         this.config = config;
         this.database = database;
+        this.editMediaBuffers = new ConcurrentHashMap<>();
         this.autoPostExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "autopost-scheduler");
             t.setDaemon(true);
@@ -152,6 +167,8 @@ public class StarsPostBot extends TelegramLongPollingBot {
             case WAIT_MEDIA -> handleMediaInput(message, userState);
             case WAIT_TEXT -> handleTextInput(message, userState);
             case WAIT_TARIFF -> handleTariffHint(message, userState);
+            case WAIT_EDIT_MEDIA -> handleEditMediaInput(message, userState);
+            case WAIT_EDIT_TEXT -> handleEditTextInput(message, userState);
             case WAIT_GROUP_ID -> handleGroupInput(message, userId);
             case WAIT_NEW_ADMIN_ID -> handleNewAdminInput(message, userId);
             case WAIT_TARIFF_PRICE -> handleTariffPriceInput(message, userState, userId);
@@ -186,6 +203,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
             startPostFlow(query, true);
             return;
         }
+        if (CB_MY_POSTS.equals(data)) {
+            showMyPosts(query);
+            return;
+        }
         if (CB_ADMIN_MENU.equals(data)) {
             if (!database.isAdmin(userId)) {
                 answerCallback(query.getId(), "Недостаточно прав", true);
@@ -208,6 +229,18 @@ public class StarsPostBot extends TelegramLongPollingBot {
         }
         if (data.startsWith(CB_TARIFF_PREFIX)) {
             applyTariff(query, data);
+            return;
+        }
+        if (data.startsWith(CB_MEDIA_DONE_PREFIX)) {
+            finishMediaStep(query, parseIdSuffix(data, CB_MEDIA_DONE_PREFIX));
+            return;
+        }
+        if (data.startsWith(CB_EDIT_POST_START_PREFIX)) {
+            startEditPostFlow(query, parseIdSuffix(data, CB_EDIT_POST_START_PREFIX));
+            return;
+        }
+        if (data.startsWith(CB_EDIT_POST_PREFIX)) {
+            showPostActions(query, parseIdSuffix(data, CB_EDIT_POST_PREFIX));
             return;
         }
         if (data.startsWith(CB_TARIFF_MENU_PREFIX)) {
@@ -298,10 +331,9 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 Тарифы:
                 %s
 
-                Сначала пришлите одно фото или одно видео.%s
-                """.formatted(formatTariffLinesForText(), modeNotice), inlineKeyboard(
-                row(button("❌ Отмена", CB_CANCEL_FLOW))
-        ));
+                Пришлите до <b>%d</b> фото/видео.
+                Когда закончите — нажмите «✅ Готово».%s
+                """.formatted(formatTariffLinesForText(), MAX_MEDIA_ITEMS, modeNotice), mediaCollectKeyboard(draftId));
     }
 
     private void handleMediaInput(Message message, UserStateData state) throws Exception {
@@ -313,32 +345,25 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return;
         }
 
-        if (message.hasPhoto()) {
-            List<PhotoSize> photos = message.getPhoto();
-            PhotoSize best = photos.get(photos.size() - 1);
-            database.setDraftMedia(draftId, MediaType.PHOTO, best.getFileId());
-            database.saveUserState(userId, ConversationState.WAIT_TEXT, draftId);
-            sendText(message.getChatId(), """
-                    Отлично, медиа получено ✅
-                    Теперь отправьте текст поста (до 1024 символов).
-                    """, inlineKeyboard(row(button("❌ Отмена", CB_CANCEL_FLOW))));
+        int before = database.countDraftMedia(draftId);
+        if (before >= MAX_MEDIA_ITEMS) {
+            sendText(message.getChatId(), "Лимит достигнут: " + MAX_MEDIA_ITEMS + "/" + MAX_MEDIA_ITEMS + ". Нажмите «✅ Готово».", mediaCollectKeyboard(draftId));
             return;
         }
-
-        if (message.hasVideo()) {
-            database.setDraftMedia(draftId, MediaType.VIDEO, message.getVideo().getFileId());
-            database.saveUserState(userId, ConversationState.WAIT_TEXT, draftId);
-            sendText(message.getChatId(), """
-                    Видео принято ✅
-                    Теперь отправьте текст поста (до 1024 символов).
-                    """, inlineKeyboard(row(button("❌ Отмена", CB_CANCEL_FLOW))));
+        if (appendMediaFromMessage(draftId, message)) {
+            int count = database.countDraftMedia(draftId);
+            if (count >= MAX_MEDIA_ITEMS) {
+                sendText(message.getChatId(), "Добавлено " + count + "/" + MAX_MEDIA_ITEMS + ". Лимит достигнут, нажмите «✅ Готово».", mediaCollectKeyboard(draftId));
+            } else {
+                sendText(message.getChatId(), "Добавлено " + count + "/" + MAX_MEDIA_ITEMS + ". Можете добавить ещё или нажмите «✅ Готово».", mediaCollectKeyboard(draftId));
+            }
             return;
         }
 
         sendText(message.getChatId(), """
-                Нужен именно один файл: фото или видео.
-                Пришлите медиа, чтобы продолжить.
-                """, inlineKeyboard(row(button("❌ Отмена", CB_CANCEL_FLOW))));
+                Пришлите фото или видео.
+                Можно отправить до 9 файлов, затем нажмите «✅ Готово».
+                """, mediaCollectKeyboard(draftId));
     }
 
     private void handleTextInput(Message message, UserStateData state) throws Exception {
@@ -381,6 +406,164 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 """, tariffKeyboard(draftId, true));
     }
 
+    private void handleEditMediaInput(Message message, UserStateData state) throws Exception {
+        Long draftId = state.draftId();
+        if (draftId == null) {
+            sendMainMenu(message.getChatId(), message.getFrom().getId());
+            return;
+        }
+        int before = countEditBufferedMedia(draftId);
+        if (before >= MAX_MEDIA_ITEMS) {
+            sendText(message.getChatId(), "Лимит достигнут: " + MAX_MEDIA_ITEMS + "/" + MAX_MEDIA_ITEMS + ". Нажмите «✅ Готово».", mediaCollectKeyboard(draftId));
+            return;
+        }
+        if (appendEditMediaFromMessage(draftId, message)) {
+            int count = countEditBufferedMedia(draftId);
+            String suffix = count >= MAX_MEDIA_ITEMS ? "Лимит достигнут, нажмите «✅ Готово»." : "Можете добавить ещё или нажмите «✅ Готово».";
+            sendText(message.getChatId(), "Добавлено " + count + "/" + MAX_MEDIA_ITEMS + ". " + suffix, mediaCollectKeyboard(draftId));
+            return;
+        }
+        sendText(message.getChatId(), "Для обновления поста пришлите фото/видео (до 9 штук), затем нажмите «✅ Готово».", mediaCollectKeyboard(draftId));
+    }
+
+    private void handleEditTextInput(Message message, UserStateData state) throws Exception {
+        long userId = message.getFrom().getId();
+        Long draftId = state.draftId();
+        if (draftId == null) {
+            database.clearUserState(userId);
+            sendMainMenu(message.getChatId(), userId);
+            return;
+        }
+        if (!message.hasText() || message.getText().isBlank()) {
+            sendText(message.getChatId(), "Отправьте новый текст поста.", inlineKeyboard(row(button("❌ Отмена", CB_CANCEL_FLOW))));
+            return;
+        }
+        String text = message.getText().trim();
+        if (text.length() > MAX_CAPTION_LENGTH) {
+            sendText(message.getChatId(), "Текст слишком длинный. Лимит: 1024 символа.", inlineKeyboard(row(button("❌ Отмена", CB_CANCEL_FLOW))));
+            return;
+        }
+        Optional<Draft> draftOpt = database.getDraft(draftId);
+        if (draftOpt.isEmpty() || draftOpt.get().userId() != userId || draftOpt.get().status() != DraftStatus.ACTIVE) {
+            editMediaBuffers.remove(draftId);
+            database.clearUserState(userId);
+            sendText(message.getChatId(), "Этот пост уже недоступен для редактирования.", mainMenuKeyboard(database.isAdmin(userId)));
+            return;
+        }
+        List<PendingMediaItem> pendingMedia = editMediaBuffers.get(draftId);
+        if (pendingMedia == null || pendingMedia.isEmpty()) {
+            database.saveUserState(userId, ConversationState.WAIT_EDIT_MEDIA, draftId);
+            sendText(message.getChatId(), "Сначала добавьте новую медиа-группу и нажмите «✅ Готово».", mediaCollectKeyboard(draftId));
+            return;
+        }
+
+        database.clearDraftMedia(draftId);
+        for (PendingMediaItem media : pendingMedia) {
+            database.addDraftMedia(draftId, media.mediaType(), media.fileId());
+        }
+        database.updateDraftTextKeepStatus(draftId, text);
+        editMediaBuffers.remove(draftId);
+        database.clearUserState(userId);
+        sendText(message.getChatId(), """
+                ✅ Данные поста обновлены.
+                При следующей переопубликации будет использована новая медиа-группа и текст.
+                """, inlineKeyboard(row(button("📂 Мои посты", CB_MY_POSTS))));
+    }
+
+    private void finishMediaStep(CallbackQuery query, long draftId) throws Exception {
+        long userId = query.getFrom().getId();
+        if (draftId <= 0) {
+            answerCallback(query.getId(), "Черновик не найден", true);
+            return;
+        }
+        Optional<Draft> draftOpt = database.getDraft(draftId);
+        if (draftOpt.isEmpty() || draftOpt.get().userId() != userId) {
+            answerCallback(query.getId(), "Черновик не найден", true);
+            return;
+        }
+
+        UserStateData state = database.getUserState(userId);
+        if (state.state() == ConversationState.WAIT_EDIT_MEDIA) {
+            int mediaCount = countEditBufferedMedia(draftId);
+            if (mediaCount <= 0) {
+                answerCallback(query.getId(), "Добавьте хотя бы одно фото/видео", true);
+                return;
+            }
+            database.saveUserState(userId, ConversationState.WAIT_EDIT_TEXT, draftId);
+            answerCallback(query.getId(), null, false);
+            sendText(query.getMessage().getChatId(), "Теперь отправьте новый текст поста (до 1024 символов).", inlineKeyboard(row(button("❌ Отмена", CB_CANCEL_FLOW))));
+            return;
+        }
+        if (state.state() == ConversationState.WAIT_MEDIA) {
+            int mediaCount = database.countDraftMedia(draftId);
+            if (mediaCount <= 0) {
+                answerCallback(query.getId(), "Добавьте хотя бы одно фото/видео", true);
+                return;
+            }
+            database.saveUserState(userId, ConversationState.WAIT_TEXT, draftId);
+            answerCallback(query.getId(), null, false);
+            sendText(query.getMessage().getChatId(), "Теперь отправьте текст поста (до 1024 символов).", inlineKeyboard(row(button("❌ Отмена", CB_CANCEL_FLOW))));
+            return;
+        }
+
+        answerCallback(query.getId(), "Сейчас этот шаг уже завершён", true);
+    }
+
+    private void showMyPosts(CallbackQuery query) throws Exception {
+        long userId = query.getFrom().getId();
+        List<Draft> active = database.listUserActiveDrafts(userId, 30);
+        answerCallback(query.getId(), null, false);
+        if (active.isEmpty()) {
+            sendText(query.getMessage().getChatId(), "У вас пока нет активных постов.", mainMenuKeyboard(database.isAdmin(userId)));
+            return;
+        }
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+        for (Draft draft : active) {
+            String until = formatTime(draft.publishUntil());
+            String label = "📌 #" + draft.id() + " | " + draft.tariffIntervalHours() + "ч | до " + until;
+            rows.add(row(button(label, CB_EDIT_POST_PREFIX + draft.id())));
+        }
+        rows.add(row(button("⬅️ Назад", CB_CANCEL_FLOW)));
+        sendText(query.getMessage().getChatId(), "📂 <b>Мои активные посты</b>\nВыберите пост для редактирования:", inlineKeyboard(rows.toArray(List[]::new)));
+    }
+
+    private void showPostActions(CallbackQuery query, long draftId) throws Exception {
+        long userId = query.getFrom().getId();
+        Optional<Draft> draftOpt = database.getDraft(draftId);
+        if (draftOpt.isEmpty() || draftOpt.get().userId() != userId || draftOpt.get().status() != DraftStatus.ACTIVE) {
+            answerCallback(query.getId(), "Пост недоступен", true);
+            return;
+        }
+        Draft draft = draftOpt.get();
+        answerCallback(query.getId(), null, false);
+        String until = formatTime(draft.publishUntil());
+        sendText(query.getMessage().getChatId(), """
+                ✅ Выбран пост <b>#%d</b>
+                Тариф: каждые <b>%dч</b>
+                Активен до: <b>%s</b>
+                """.formatted(draft.id(), draft.tariffIntervalHours(), until), inlineKeyboard(
+                row(button("✏️ Изменить", CB_EDIT_POST_START_PREFIX + draftId)),
+                row(button("⬅️ Назад", CB_MY_POSTS))
+        ));
+    }
+
+    private void startEditPostFlow(CallbackQuery query, long draftId) throws Exception {
+        long userId = query.getFrom().getId();
+        Optional<Draft> draftOpt = database.getDraft(draftId);
+        if (draftOpt.isEmpty() || draftOpt.get().userId() != userId || draftOpt.get().status() != DraftStatus.ACTIVE) {
+            answerCallback(query.getId(), "Пост недоступен для редактирования", true);
+            return;
+        }
+        editMediaBuffers.put(draftId, new ArrayList<>());
+        database.saveUserState(userId, ConversationState.WAIT_EDIT_MEDIA, draftId);
+        answerCallback(query.getId(), null, false);
+        sendText(query.getMessage().getChatId(), """
+                ✏️ Редактирование поста #%d
+                Пришлите новую медиа-группу (до %d фото/видео).
+                Затем нажмите «✅ Готово».
+                """.formatted(draftId, MAX_MEDIA_ITEMS), mediaCollectKeyboard(draftId));
+    }
+
     private void applyTariff(CallbackQuery query, String callbackData) throws Exception {
         long userId = query.getFrom().getId();
         String[] parts = callbackData.split(":");
@@ -420,7 +603,8 @@ public class StarsPostBot extends TelegramLongPollingBot {
             answerCallback(query.getId(), "Черновик недоступен", true);
             return;
         }
-        if (draft.mediaType() == null || draft.mediaFileId() == null || draft.postText() == null || draft.postText().isBlank()) {
+        List<DraftMedia> media = database.listDraftMedia(draftId);
+        if (media.isEmpty() || draft.postText() == null || draft.postText().isBlank()) {
             answerCallback(query.getId(), "Черновик не заполнен полностью", true);
             return;
         }
@@ -435,7 +619,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
 
                 Проверьте предпросмотр и нажмите «Оплатить».
                 """.formatted(tariff.intervalHours(), tariff.priceStars()), null);
-        sendPreviewMedia(userId, draft, paymentKeyboard(draftId, tariff));
+        sendPreviewMedia(userId, draft, media, paymentKeyboard(draftId, tariff));
     }
 
     private InlineKeyboardMarkup tariffKeyboard(long draftId, boolean includeRestart) {
@@ -503,6 +687,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
         TariffPlan tariff = tariffFromDraft(draft);
         if (tariff == null) {
             answerCallback(query.getId(), "Сначала выберите тариф", true);
+            return;
+        }
+        if (database.listDraftMedia(draftId).isEmpty()) {
+            answerCallback(query.getId(), "Добавьте медиа для поста", true);
             return;
         }
         int postPrice = tariff.priceStars();
@@ -675,8 +863,9 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return;
         }
 
-        Integer firstMessageId = publishDraftToGroupAndGetMessageId(groupIdOpt.get(), draft);
-        if (firstMessageId == null) {
+        List<DraftMedia> media = database.listDraftMedia(draft.id());
+        PublishResult firstPublish = publishDraftToGroup(groupIdOpt.get(), draft, media);
+        if (firstPublish == null) {
             database.updatePaymentStatusByDraft(draft.id(), simulated ? "AUTOPOST_START_FAILED_TEST" : "AUTOPOST_START_FAILED");
             sendText(chatId, """
                     %s
@@ -688,7 +877,14 @@ public class StarsPostBot extends TelegramLongPollingBot {
         Instant now = Instant.now();
         Instant nextPublishAt = now.plus(Duration.ofHours(tariff.intervalHours()));
         Instant publishUntil = now.plus(CAMPAIGN_DURATION);
-        database.activateAutoPosting(draft.id(), nextPublishAt.toString(), publishUntil.toString(), firstMessageId, 1);
+        database.activateAutoPosting(
+                draft.id(),
+                nextPublishAt.toString(),
+                publishUntil.toString(),
+                firstPublish.firstMessageId(),
+                firstPublish.messageCount(),
+                1
+        );
         database.updatePaymentStatusByDraft(draft.id(), simulated ? PAY_STATUS_RUNNING_TEST : PAY_STATUS_RUNNING);
         database.clearUserState(userId);
         sendText(chatId, """
@@ -699,13 +895,16 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 """.formatted(simulated ? "🧪 Тестовая оплата подтверждена." : "✅ Оплата подтверждена.", tariff.intervalHours()), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
     }
 
-    private boolean publishDraftToGroup(long groupId, Draft draft) {
-        return publishDraftToGroupAndGetMessageId(groupId, draft) != null;
-    }
-
-    private Integer publishDraftToGroupAndGetMessageId(long groupId, Draft draft) {
+    private PublishResult publishDraftToGroup(long groupId, Draft draft, List<DraftMedia> media) {
         try {
-            return sendPreviewMedia(groupId, draft, null).getMessageId();
+            if (media == null || media.isEmpty()) {
+                return null;
+            }
+            List<Message> sent = sendMediaCollection(groupId, media, draft.postText(), null);
+            if (sent.isEmpty()) {
+                return null;
+            }
+            return new PublishResult(sent.get(0).getMessageId(), sent.size());
         } catch (TelegramApiException e) {
             log.error("Failed to publish draft {}", draft.id(), e);
             return null;
@@ -731,13 +930,14 @@ public class StarsPostBot extends TelegramLongPollingBot {
         for (AutoPostJob job : jobs) {
             Instant publishUntil = parseInstant(job.publishUntil());
             if (publishUntil == null || !now.isBefore(publishUntil)) {
-                database.completeAutoPosting(job.draftId(), job.lastGroupMessageId(), job.publishCount());
+                database.completeAutoPosting(job.draftId(), job.lastGroupMessageId(), job.lastGroupMediaCount(), job.publishCount());
                 database.updatePaymentStatusByDraft(job.draftId(), mapCompletedStatus(job.draftId()));
                 continue;
             }
 
             if (job.lastGroupMessageId() != null) {
-                deleteGroupMessageSilently(groupIdOpt.get(), job.lastGroupMessageId());
+                int count = job.lastGroupMediaCount() == null || job.lastGroupMediaCount() <= 0 ? 1 : job.lastGroupMediaCount();
+                deleteGroupMessagesSilently(groupIdOpt.get(), job.lastGroupMessageId(), count);
             }
 
             Draft draft = new Draft(
@@ -752,11 +952,13 @@ public class StarsPostBot extends TelegramLongPollingBot {
                     job.nextPublishAt(),
                     job.publishUntil(),
                     job.publishCount(),
-                    job.lastGroupMessageId()
+                    job.lastGroupMessageId(),
+                    job.lastGroupMediaCount()
             );
 
-            Integer postedMessageId = publishDraftToGroupAndGetMessageId(groupIdOpt.get(), draft);
-            if (postedMessageId == null) {
+            List<DraftMedia> media = database.listDraftMedia(job.draftId());
+            PublishResult result = publishDraftToGroup(groupIdOpt.get(), draft, media);
+            if (result == null) {
                 database.markAutoPostFailureRetry(job.draftId(), now.plus(FAILED_RETRY_DELAY).toString());
                 continue;
             }
@@ -764,10 +966,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
             int newCount = job.publishCount() + 1;
             Instant nextPublish = now.plus(Duration.ofHours(job.tariffIntervalHours()));
             if (!nextPublish.isBefore(publishUntil)) {
-                database.completeAutoPosting(job.draftId(), postedMessageId, newCount);
+                database.completeAutoPosting(job.draftId(), result.firstMessageId(), result.messageCount(), newCount);
                 database.updatePaymentStatusByDraft(job.draftId(), mapCompletedStatus(job.draftId()));
             } else {
-                database.markAutoPostSuccess(job.draftId(), nextPublish.toString(), newCount, postedMessageId);
+                database.markAutoPostSuccess(job.draftId(), nextPublish.toString(), newCount, result.firstMessageId(), result.messageCount());
             }
         }
     }
@@ -1050,6 +1252,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
 
     private void cancelDraftFlow(CallbackQuery query, Long draftId, boolean restart) throws Exception {
         long userId = query.getFrom().getId();
+        UserStateData state = database.getUserState(userId);
+        if ((state.state() == ConversationState.WAIT_EDIT_MEDIA || state.state() == ConversationState.WAIT_EDIT_TEXT) && state.draftId() != null) {
+            editMediaBuffers.remove(state.draftId());
+        }
         database.clearUserState(userId);
         if (draftId != null) {
             Optional<Draft> draftOpt = database.getDraft(draftId);
@@ -1084,6 +1290,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private InlineKeyboardMarkup mainMenuKeyboard(boolean isAdmin) {
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
         rows.add(row(button("📝 Сделать пост", CB_MAKE_POST)));
+        rows.add(row(button("📂 Мои посты", CB_MY_POSTS)));
         if (isAdmin) {
             rows.add(row(button("🛠 Админ-панель", CB_ADMIN_MENU)));
         }
@@ -1116,24 +1323,59 @@ public class StarsPostBot extends TelegramLongPollingBot {
         );
     }
 
-    private Message sendPreviewMedia(long chatId, Draft draft, InlineKeyboardMarkup markup) throws TelegramApiException {
-        if (draft.mediaType() == MediaType.PHOTO) {
-            SendPhoto sendPhoto = new SendPhoto();
-            sendPhoto.setChatId(String.valueOf(chatId));
-            sendPhoto.setPhoto(new InputFile(draft.mediaFileId()));
-            sendPhoto.setCaption(draft.postText());
-            sendPhoto.setReplyMarkup(markup);
-            return execute(sendPhoto);
+    private void sendPreviewMedia(long chatId, Draft draft, List<DraftMedia> media, InlineKeyboardMarkup markup) throws TelegramApiException {
+        List<Message> sent = sendMediaCollection(chatId, media, draft.postText(), null);
+        if (markup != null) {
+            sendText(chatId, "Нажмите кнопку ниже для оплаты:", markup);
         }
-        if (draft.mediaType() == MediaType.VIDEO) {
+    }
+
+    private List<Message> sendMediaCollection(long chatId, List<DraftMedia> media, String caption, InlineKeyboardMarkup markup) throws TelegramApiException {
+        if (media == null || media.isEmpty()) {
+            return Collections.emptyList();
+        }
+        if (media.size() == 1) {
+            DraftMedia item = media.get(0);
+            if (item.mediaType() == MediaType.PHOTO) {
+                SendPhoto sendPhoto = new SendPhoto();
+                sendPhoto.setChatId(String.valueOf(chatId));
+                sendPhoto.setPhoto(new InputFile(item.fileId()));
+                sendPhoto.setCaption(caption);
+                sendPhoto.setReplyMarkup(markup);
+                return List.of(execute(sendPhoto));
+            }
             SendVideo sendVideo = new SendVideo();
             sendVideo.setChatId(String.valueOf(chatId));
-            sendVideo.setVideo(new InputFile(draft.mediaFileId()));
-            sendVideo.setCaption(draft.postText());
+            sendVideo.setVideo(new InputFile(item.fileId()));
+            sendVideo.setCaption(caption);
             sendVideo.setReplyMarkup(markup);
-            return execute(sendVideo);
+            return List.of(execute(sendVideo));
         }
-        throw new TelegramApiException("Unsupported media type");
+
+        SendMediaGroup group = new SendMediaGroup();
+        group.setChatId(String.valueOf(chatId));
+        List<InputMedia> mediaItems = new ArrayList<>();
+        for (int i = 0; i < media.size(); i++) {
+            DraftMedia item = media.get(i);
+            InputMedia im;
+            if (item.mediaType() == MediaType.PHOTO) {
+                im = new InputMediaPhoto(item.fileId());
+            } else {
+                im = new InputMediaVideo(item.fileId());
+            }
+            if (i == 0 && caption != null && !caption.isBlank()) {
+                im.setCaption(caption);
+            }
+            mediaItems.add(im);
+        }
+        group.setMedias(mediaItems);
+        return execute(group);
+    }
+
+    private void deleteGroupMessagesSilently(long groupId, int firstMessageId, int count) {
+        for (int i = 0; i < Math.max(1, count); i++) {
+            deleteGroupMessageSilently(groupId, firstMessageId + i);
+        }
     }
 
     private void deleteGroupMessageSilently(long groupId, int messageId) {
@@ -1145,6 +1387,55 @@ public class StarsPostBot extends TelegramLongPollingBot {
         } catch (TelegramApiException e) {
             log.warn("Failed to delete old group message {} in {}", messageId, groupId, e);
         }
+    }
+
+    private boolean appendMediaFromMessage(long draftId, Message message) throws SQLException {
+        int count = database.countDraftMedia(draftId);
+        if (count >= MAX_MEDIA_ITEMS) {
+            return false;
+        }
+
+        if (message.hasPhoto()) {
+            List<PhotoSize> photos = message.getPhoto();
+            PhotoSize best = photos.get(photos.size() - 1);
+            database.addDraftMedia(draftId, MediaType.PHOTO, best.getFileId());
+            return true;
+        }
+        if (message.hasVideo()) {
+            database.addDraftMedia(draftId, MediaType.VIDEO, message.getVideo().getFileId());
+            return true;
+        }
+        return false;
+    }
+
+    private int countEditBufferedMedia(long draftId) {
+        List<PendingMediaItem> media = editMediaBuffers.get(draftId);
+        return media == null ? 0 : media.size();
+    }
+
+    private boolean appendEditMediaFromMessage(long draftId, Message message) {
+        List<PendingMediaItem> media = editMediaBuffers.computeIfAbsent(draftId, k -> new ArrayList<>());
+        if (media.size() >= MAX_MEDIA_ITEMS) {
+            return false;
+        }
+        if (message.hasPhoto()) {
+            List<PhotoSize> photos = message.getPhoto();
+            PhotoSize best = photos.get(photos.size() - 1);
+            media.add(new PendingMediaItem(MediaType.PHOTO, best.getFileId()));
+            return true;
+        }
+        if (message.hasVideo()) {
+            media.add(new PendingMediaItem(MediaType.VIDEO, message.getVideo().getFileId()));
+            return true;
+        }
+        return false;
+    }
+
+    private InlineKeyboardMarkup mediaCollectKeyboard(long draftId) {
+        return inlineKeyboard(
+                row(button("✅ Готово", CB_MEDIA_DONE_PREFIX + draftId)),
+                row(button("❌ Отмена", CB_CANCEL_FLOW))
+        );
     }
 
     private void sendText(long chatId, String text, InlineKeyboardMarkup markup) throws TelegramApiException {
@@ -1324,6 +1615,12 @@ public class StarsPostBot extends TelegramLongPollingBot {
     }
 
     private record TariffPlan(int intervalHours, int priceStars) {
+    }
+
+    private record PublishResult(int firstMessageId, int messageCount) {
+    }
+
+    private record PendingMediaItem(MediaType mediaType, String fileId) {
     }
 
     private String formatTime(String isoInstant) {

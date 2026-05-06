@@ -4,6 +4,7 @@ import com.example.starsbot.model.AdminInfo;
 import com.example.starsbot.model.AutoPostJob;
 import com.example.starsbot.model.ConversationState;
 import com.example.starsbot.model.Draft;
+import com.example.starsbot.model.DraftMedia;
 import com.example.starsbot.model.DraftStatus;
 import com.example.starsbot.model.MediaType;
 import com.example.starsbot.model.PaymentInfo;
@@ -84,6 +85,17 @@ public class Database {
                 addDraftColumnIfMissing(st, "publish_until TEXT");
                 addDraftColumnIfMissing(st, "publish_count INTEGER NOT NULL DEFAULT 0");
                 addDraftColumnIfMissing(st, "last_group_message_id INTEGER");
+                addDraftColumnIfMissing(st, "last_group_media_count INTEGER NOT NULL DEFAULT 1");
+                st.execute("""
+                        CREATE TABLE IF NOT EXISTS draft_media (
+                            draft_id INTEGER NOT NULL,
+                            position INTEGER NOT NULL,
+                            media_type TEXT NOT NULL,
+                            file_id TEXT NOT NULL,
+                            PRIMARY KEY (draft_id, position),
+                            FOREIGN KEY (draft_id) REFERENCES drafts(id) ON DELETE CASCADE
+                        )
+                        """);
                 st.execute("""
                         CREATE TABLE IF NOT EXISTS payments (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -334,7 +346,7 @@ public class Database {
         String sql = """
                 SELECT id, user_id, media_type, media_file_id, post_text, status,
                        tariff_interval_hours, tariff_price_stars, next_publish_at, publish_until, publish_count,
-                       last_group_message_id
+                       last_group_message_id, last_group_media_count
                 FROM drafts
                 WHERE id = ?
                 """;
@@ -362,7 +374,8 @@ public class Database {
                         rs.getString("next_publish_at"),
                         rs.getString("publish_until"),
                         rs.getInt("publish_count"),
-                        getNullableInt(rs, "last_group_message_id")
+                        getNullableInt(rs, "last_group_message_id"),
+                        getNullableInt(rs, "last_group_media_count")
                 ));
             }
         }
@@ -384,6 +397,90 @@ public class Database {
         }
     }
 
+    public synchronized void clearDraftMedia(long draftId) throws SQLException {
+        try (Connection conn = open()) {
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM draft_media WHERE draft_id = ?")) {
+                ps.setLong(1, draftId);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    UPDATE drafts
+                    SET media_type = NULL, media_file_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """)) {
+                ps.setString(1, now());
+                ps.setLong(2, draftId);
+                ps.executeUpdate();
+            }
+        }
+    }
+
+    public synchronized int countDraftMedia(long draftId) throws SQLException {
+        String sql = "SELECT COUNT(*) FROM draft_media WHERE draft_id = ?";
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, draftId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getInt(1);
+                }
+            }
+        }
+        return 0;
+    }
+
+    public synchronized void addDraftMedia(long draftId, MediaType mediaType, String fileId) throws SQLException {
+        int position = countDraftMedia(draftId) + 1;
+        String sql = """
+                INSERT INTO draft_media(draft_id, position, media_type, file_id)
+                VALUES (?, ?, ?, ?)
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, draftId);
+            ps.setInt(2, position);
+            ps.setString(3, mediaType.name());
+            ps.setString(4, fileId);
+            ps.executeUpdate();
+        }
+        if (position == 1) {
+            setDraftMedia(draftId, mediaType, fileId);
+        }
+    }
+
+    public synchronized List<DraftMedia> listDraftMedia(long draftId) throws SQLException {
+        String sql = """
+                SELECT draft_id, position, media_type, file_id
+                FROM draft_media
+                WHERE draft_id = ?
+                ORDER BY position ASC
+                """;
+        List<DraftMedia> media = new ArrayList<>();
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, draftId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    media.add(new DraftMedia(
+                            rs.getLong("draft_id"),
+                            rs.getInt("position"),
+                            MediaType.valueOf(rs.getString("media_type")),
+                            rs.getString("file_id")
+                    ));
+                }
+            }
+        }
+        if (!media.isEmpty()) {
+            return media;
+        }
+
+        Optional<Draft> legacy = getDraft(draftId);
+        if (legacy.isPresent() && legacy.get().mediaType() != null && legacy.get().mediaFileId() != null) {
+            return List.of(new DraftMedia(draftId, 1, legacy.get().mediaType(), legacy.get().mediaFileId()));
+        }
+        return media;
+    }
+
     public synchronized void setDraftText(long draftId, String text) throws SQLException {
         String sql = """
                 UPDATE drafts
@@ -396,6 +493,21 @@ public class Database {
             ps.setString(2, DraftStatus.READY.name());
             ps.setString(3, now());
             ps.setLong(4, draftId);
+            ps.executeUpdate();
+        }
+    }
+
+    public synchronized void updateDraftTextKeepStatus(long draftId, String text) throws SQLException {
+        String sql = """
+                UPDATE drafts
+                SET post_text = ?, updated_at = ?
+                WHERE id = ?
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, text);
+            ps.setString(2, now());
+            ps.setLong(3, draftId);
             ps.executeUpdate();
         }
     }
@@ -436,11 +548,12 @@ public class Database {
             String firstPublishAt,
             String publishUntil,
             Integer lastGroupMessageId,
+            Integer lastGroupMediaCount,
             int publishCount
     ) throws SQLException {
         String sql = """
                 UPDATE drafts
-                SET status = ?, next_publish_at = ?, publish_until = ?, publish_count = ?, last_group_message_id = ?, updated_at = ?
+                SET status = ?, next_publish_at = ?, publish_until = ?, publish_count = ?, last_group_message_id = ?, last_group_media_count = ?, updated_at = ?
                 WHERE id = ?
                 """;
         try (Connection conn = open();
@@ -454,8 +567,13 @@ public class Database {
             } else {
                 ps.setInt(5, lastGroupMessageId);
             }
-            ps.setString(6, now());
-            ps.setLong(7, draftId);
+            if (lastGroupMediaCount == null) {
+                ps.setNull(6, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(6, lastGroupMediaCount);
+            }
+            ps.setString(7, now());
+            ps.setLong(8, draftId);
             ps.executeUpdate();
         }
     }
@@ -463,7 +581,7 @@ public class Database {
     public synchronized List<AutoPostJob> listDueAutoPostJobs(String nowIso, int limit) throws SQLException {
         String sql = """
                 SELECT id, user_id, media_type, media_file_id, post_text,
-                       tariff_interval_hours, next_publish_at, publish_until, publish_count, last_group_message_id
+                       tariff_interval_hours, next_publish_at, publish_until, publish_count, last_group_message_id, last_group_media_count
                 FROM drafts
                 WHERE status = ?
                   AND next_publish_at IS NOT NULL
@@ -496,7 +614,8 @@ public class Database {
                             rs.getString("next_publish_at"),
                             rs.getString("publish_until"),
                             rs.getInt("publish_count"),
-                            getNullableInt(rs, "last_group_message_id")
+                            getNullableInt(rs, "last_group_message_id"),
+                            getNullableInt(rs, "last_group_media_count")
                     ));
                 }
             }
@@ -504,10 +623,51 @@ public class Database {
         return jobs;
     }
 
-    public synchronized void completeAutoPosting(long draftId, Integer lastGroupMessageId, int publishCount) throws SQLException {
+    public synchronized List<Draft> listUserActiveDrafts(long userId, int limit) throws SQLException {
+        String sql = """
+                SELECT id, user_id, media_type, media_file_id, post_text, status,
+                       tariff_interval_hours, tariff_price_stars, next_publish_at, publish_until, publish_count,
+                       last_group_message_id, last_group_media_count
+                FROM drafts
+                WHERE user_id = ? AND status = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """;
+        List<Draft> drafts = new ArrayList<>();
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setString(2, DraftStatus.ACTIVE.name());
+            ps.setInt(3, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String mediaTypeRaw = rs.getString("media_type");
+                    MediaType mediaType = mediaTypeRaw == null ? null : MediaType.valueOf(mediaTypeRaw);
+                    drafts.add(new Draft(
+                            rs.getLong("id"),
+                            rs.getLong("user_id"),
+                            mediaType,
+                            rs.getString("media_file_id"),
+                            rs.getString("post_text"),
+                            DraftStatus.valueOf(rs.getString("status")),
+                            getNullableInt(rs, "tariff_interval_hours"),
+                            getNullableInt(rs, "tariff_price_stars"),
+                            rs.getString("next_publish_at"),
+                            rs.getString("publish_until"),
+                            rs.getInt("publish_count"),
+                            getNullableInt(rs, "last_group_message_id"),
+                            getNullableInt(rs, "last_group_media_count")
+                    ));
+                }
+            }
+        }
+        return drafts;
+    }
+
+    public synchronized void completeAutoPosting(long draftId, Integer lastGroupMessageId, Integer lastGroupMediaCount, int publishCount) throws SQLException {
         String sql = """
                 UPDATE drafts
-                SET status = ?, next_publish_at = NULL, publish_count = ?, last_group_message_id = ?, updated_at = ?
+                SET status = ?, next_publish_at = NULL, publish_count = ?, last_group_message_id = ?, last_group_media_count = ?, updated_at = ?
                 WHERE id = ?
                 """;
         try (Connection conn = open();
@@ -519,16 +679,21 @@ public class Database {
             } else {
                 ps.setInt(3, lastGroupMessageId);
             }
-            ps.setString(4, now());
-            ps.setLong(5, draftId);
+            if (lastGroupMediaCount == null) {
+                ps.setNull(4, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(4, lastGroupMediaCount);
+            }
+            ps.setString(5, now());
+            ps.setLong(6, draftId);
             ps.executeUpdate();
         }
     }
 
-    public synchronized void markAutoPostSuccess(long draftId, String nextPublishAt, int newPublishCount, Integer lastGroupMessageId) throws SQLException {
+    public synchronized void markAutoPostSuccess(long draftId, String nextPublishAt, int newPublishCount, Integer lastGroupMessageId, Integer lastGroupMediaCount) throws SQLException {
         String sql = """
                 UPDATE drafts
-                SET next_publish_at = ?, publish_count = ?, last_group_message_id = ?, updated_at = ?
+                SET next_publish_at = ?, publish_count = ?, last_group_message_id = ?, last_group_media_count = ?, updated_at = ?
                 WHERE id = ? AND status = ?
                 """;
         try (Connection conn = open();
@@ -540,9 +705,14 @@ public class Database {
             } else {
                 ps.setInt(3, lastGroupMessageId);
             }
-            ps.setString(4, now());
-            ps.setLong(5, draftId);
-            ps.setString(6, DraftStatus.ACTIVE.name());
+            if (lastGroupMediaCount == null) {
+                ps.setNull(4, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(4, lastGroupMediaCount);
+            }
+            ps.setString(5, now());
+            ps.setLong(6, draftId);
+            ps.setString(7, DraftStatus.ACTIVE.name());
             ps.executeUpdate();
         }
     }
