@@ -34,6 +34,7 @@ import org.telegram.telegrambots.meta.api.objects.payments.SuccessfulPayment;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiRequestException;
 
 import java.sql.SQLException;
 import java.time.Duration;
@@ -59,8 +60,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String CURRENCY_STARS = "XTR";
     private static final int MAX_CAPTION_LENGTH = 1024;
     private static final Pattern PAYLOAD_PATTERN = Pattern.compile("^draft:(\\d+)(?::(\\d+))?$");
+    private static final Pattern RETRY_AFTER_PATTERN = Pattern.compile("retry after\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
     private static final Duration CAMPAIGN_DURATION = Duration.ofDays(7);
     private static final Duration FAILED_RETRY_DELAY = Duration.ofMinutes(10);
+    private static final Duration FIRST_PUBLISH_FALLBACK_RETRY_DELAY = Duration.ofMinutes(2);
+    private static final int RETRY_PADDING_SECONDS = 2;
 
     private static final String CB_MAKE_POST = "make_post";
     private static final String CB_ADMIN_MENU = "admin_menu";
@@ -864,19 +868,37 @@ public class StarsPostBot extends TelegramLongPollingBot {
         }
 
         List<DraftMedia> media = database.listDraftMedia(draft.id());
-        PublishResult firstPublish = publishDraftToGroup(groupIdOpt.get(), draft, media);
-        if (firstPublish == null) {
-            database.updatePaymentStatusByDraft(draft.id(), simulated ? "AUTOPOST_START_FAILED_TEST" : "AUTOPOST_START_FAILED");
+        Instant now = Instant.now();
+        Instant publishUntil = now.plus(CAMPAIGN_DURATION);
+        PublishAttempt firstAttempt = publishDraftToGroup(groupIdOpt.get(), draft, media);
+        if (!firstAttempt.success()) {
+            Instant retryAt = now.plusSeconds(resolveRetryDelaySeconds(firstAttempt.retryAfterSeconds(), FIRST_PUBLISH_FALLBACK_RETRY_DELAY));
+            database.activateAutoPosting(
+                    draft.id(),
+                    retryAt.toString(),
+                    publishUntil.toString(),
+                    null,
+                    media.size(),
+                    0
+            );
+            database.updatePaymentStatusByDraft(draft.id(), simulated ? PAY_STATUS_RUNNING_TEST : PAY_STATUS_RUNNING);
+            database.clearUserState(userId);
+
+            String retryText = firstAttempt.retryAfterSeconds() != null
+                    ? "Telegram временно ограничил отправку. Попробуем снова через " + firstAttempt.retryAfterSeconds() + " сек."
+                    : "Сейчас есть временные сложности с отправкой. Пост будет отправлен автоматически при ближайшей повторной попытке.";
             sendText(chatId, """
                     %s
-                    Не удалось сделать первый пост в группе. Проверьте права бота и настройки группы.
-                    """.formatted(simulated ? "Тестовая оплата подтверждена." : "Оплата подтверждена."), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
+                    💳 Оплата принята.
+                    ⏳ Первый запуск поста будет выполнен в течение 10 минут.
+                    %s
+                    Кампания уже запущена и будет работать 7 дней.
+                    """.formatted(simulated ? "🧪 Тестовая оплата подтверждена." : "✅ Оплата подтверждена.", retryText), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
             return;
         }
 
-        Instant now = Instant.now();
+        PublishResult firstPublish = firstAttempt.result();
         Instant nextPublishAt = now.plus(Duration.ofHours(tariff.intervalHours()));
-        Instant publishUntil = now.plus(CAMPAIGN_DURATION);
         database.activateAutoPosting(
                 draft.id(),
                 nextPublishAt.toString(),
@@ -889,25 +911,34 @@ public class StarsPostBot extends TelegramLongPollingBot {
         database.clearUserState(userId);
         sendText(chatId, """
                 %s
+                ⏳ Первый запуск поста будет выполнен в течение 10 минут.
                 🚀 Кампания автопостинга на 7 дней запущена.
                 Публикация: каждые <b>%d часа(ов)</b>.
                 Спасибо за оплату!
                 """.formatted(simulated ? "🧪 Тестовая оплата подтверждена." : "✅ Оплата подтверждена.", tariff.intervalHours()), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
     }
 
-    private PublishResult publishDraftToGroup(long groupId, Draft draft, List<DraftMedia> media) {
+    private PublishAttempt publishDraftToGroup(long groupId, Draft draft, List<DraftMedia> media) {
         try {
             if (media == null || media.isEmpty()) {
-                return null;
+                return new PublishAttempt(null, null);
             }
             List<Message> sent = sendMediaCollection(groupId, media, draft.postText(), null);
             if (sent.isEmpty()) {
-                return null;
+                return new PublishAttempt(null, null);
             }
-            return new PublishResult(sent.get(0).getMessageId(), sent.size());
+            return new PublishAttempt(new PublishResult(sent.get(0).getMessageId(), sent.size()), null);
+        } catch (TelegramApiRequestException e) {
+            Integer retryAfter = extractRetryAfterSeconds(e);
+            if (retryAfter != null) {
+                log.warn("Rate limited while publishing draft {}. Retry after {} sec", draft.id(), retryAfter);
+            } else {
+                log.error("Failed to publish draft {}", draft.id(), e);
+            }
+            return new PublishAttempt(null, retryAfter);
         } catch (TelegramApiException e) {
             log.error("Failed to publish draft {}", draft.id(), e);
-            return null;
+            return new PublishAttempt(null, null);
         }
     }
 
@@ -957,11 +988,13 @@ public class StarsPostBot extends TelegramLongPollingBot {
             );
 
             List<DraftMedia> media = database.listDraftMedia(job.draftId());
-            PublishResult result = publishDraftToGroup(groupIdOpt.get(), draft, media);
-            if (result == null) {
-                database.markAutoPostFailureRetry(job.draftId(), now.plus(FAILED_RETRY_DELAY).toString());
+            PublishAttempt attempt = publishDraftToGroup(groupIdOpt.get(), draft, media);
+            if (!attempt.success()) {
+                Instant retryAt = now.plusSeconds(resolveRetryDelaySeconds(attempt.retryAfterSeconds(), FAILED_RETRY_DELAY));
+                database.markAutoPostFailureRetry(job.draftId(), retryAt.toString());
                 continue;
             }
+            PublishResult result = attempt.result();
 
             int newCount = job.publishCount() + 1;
             Instant nextPublish = now.plus(Duration.ofHours(job.tariffIntervalHours()));
@@ -1611,6 +1644,36 @@ public class StarsPostBot extends TelegramLongPollingBot {
         return PAY_STATUS_COMPLETED;
     }
 
+    private Integer extractRetryAfterSeconds(TelegramApiRequestException e) {
+        if (e == null) {
+            return null;
+        }
+        if (e.getParameters() != null && e.getParameters().getRetryAfter() != null && e.getParameters().getRetryAfter() > 0) {
+            return e.getParameters().getRetryAfter();
+        }
+        String msg = e.getMessage();
+        if (msg == null) {
+            return null;
+        }
+        Matcher matcher = RETRY_AFTER_PATTERN.matcher(msg);
+        if (!matcher.find()) {
+            return null;
+        }
+        try {
+            int parsed = Integer.parseInt(matcher.group(1));
+            return parsed > 0 ? parsed : null;
+        } catch (NumberFormatException ignore) {
+            return null;
+        }
+    }
+
+    private long resolveRetryDelaySeconds(Integer retryAfterSeconds, Duration fallbackDelay) {
+        if (retryAfterSeconds == null || retryAfterSeconds <= 0) {
+            return Math.max(1L, fallbackDelay.getSeconds());
+        }
+        return retryAfterSeconds + RETRY_PADDING_SECONDS;
+    }
+
     private record InvoicePayload(long draftId, int amount) {
     }
 
@@ -1618,6 +1681,12 @@ public class StarsPostBot extends TelegramLongPollingBot {
     }
 
     private record PublishResult(int firstMessageId, int messageCount) {
+    }
+
+    private record PublishAttempt(PublishResult result, Integer retryAfterSeconds) {
+        private boolean success() {
+            return result != null;
+        }
     }
 
     private record PendingMediaItem(MediaType mediaType, String fileId) {
