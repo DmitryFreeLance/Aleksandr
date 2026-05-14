@@ -89,8 +89,8 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String PAY_STATUS_COMPLETED = "AUTOPOST_COMPLETED";
     private static final String PAY_STATUS_RUNNING_TEST = "AUTOPOST_RUNNING_TEST";
     private static final String PAY_STATUS_COMPLETED_TEST = "AUTOPOST_COMPLETED_TEST";
-    private static final String VERIFIED_BADGE_REAL = "Проверена. РЕАЛ";
-    private static final String VERIFIED_BADGE_VIRT = "Проверена. ВИРТ";
+    private static final String VERIFIED_MESSAGE_REAL = "Проверена. РЕАЛ ☝️";
+    private static final String VERIFIED_MESSAGE_VIRT = "Проверена. ВИРТ ☝️";
 
     private final BotConfig config;
     private final Database database;
@@ -927,11 +927,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
             if (media == null || media.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
-            String caption = decorateCaptionWithVerificationBadge(draft.postText(), draft.userId(), payerUsername);
-            List<Message> sent = sendMediaCollection(groupId, media, caption, null);
+            List<Message> sent = sendMediaCollection(groupId, media, draft.postText(), null);
             if (sent.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
+            sendVerificationMessage(groupId, sent.get(0).getMessageId(), draft.userId(), payerUsername);
             return new PublishAttempt(new PublishResult(sent.get(0).getMessageId(), sent.size()), null);
         } catch (TelegramApiRequestException e) {
             Integer retryAfter = extractRetryAfterSeconds(e);
@@ -1634,43 +1634,22 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 """.formatted(t2.priceStars(), t4.priceStars(), t6.priceStars()).trim();
     }
 
-    private String decorateCaptionWithVerificationBadge(String caption, long userId, String username) {
-        String base = caption == null ? "" : caption.trim();
-        Optional<String> badgeOpt = verificationBadgeResolver.resolveBadge(userId, username);
-        if (badgeOpt.isEmpty()) {
-            return base;
-        }
-        if (containsVerificationBadge(base)) {
-            return base;
+    private void sendVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
+        Optional<String> badge = verificationBadgeResolver.resolveBadge(userId, username);
+        if (badge.isEmpty()) {
+            return;
         }
 
-        String badge = badgeOpt.get();
-        if (base.isBlank()) {
-            return badge.length() <= MAX_CAPTION_LENGTH ? badge : badge.substring(0, MAX_CAPTION_LENGTH);
+        String text = badge.get().contains("РЕАЛ") ? VERIFIED_MESSAGE_REAL : VERIFIED_MESSAGE_VIRT;
+        SendMessage verificationMessage = new SendMessage();
+        verificationMessage.setChatId(String.valueOf(chatId));
+        verificationMessage.setReplyToMessageId(replyToMessageId);
+        verificationMessage.setText(text);
+        try {
+            execute(verificationMessage);
+        } catch (TelegramApiException e) {
+            log.warn("Failed to send verification message for user {}", userId, e);
         }
-
-        String combined = base + "\n\n" + badge;
-        if (combined.length() <= MAX_CAPTION_LENGTH) {
-            return combined;
-        }
-
-        int maxBaseLength = MAX_CAPTION_LENGTH - badge.length() - 2;
-        if (maxBaseLength <= 0) {
-            return badge.length() <= MAX_CAPTION_LENGTH ? badge : badge.substring(0, MAX_CAPTION_LENGTH);
-        }
-
-        String shortenedBase = base.length() <= maxBaseLength ? base : base.substring(0, maxBaseLength).trim();
-        if (shortenedBase.isBlank()) {
-            return badge.length() <= MAX_CAPTION_LENGTH ? badge : badge.substring(0, MAX_CAPTION_LENGTH);
-        }
-        log.warn("Caption for user {} was trimmed to fit verification badge", userId);
-        return shortenedBase + "\n\n" + badge;
-    }
-
-    private boolean containsVerificationBadge(String caption) {
-        String lower = caption.toLowerCase(Locale.ROOT);
-        return lower.contains(VERIFIED_BADGE_REAL.toLowerCase(Locale.ROOT))
-                || lower.contains(VERIFIED_BADGE_VIRT.toLowerCase(Locale.ROOT));
     }
 
     private Instant parseInstant(String value) {
