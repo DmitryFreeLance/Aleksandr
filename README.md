@@ -28,6 +28,7 @@
 - `BOT_USERNAME` — username бота (без `@`).
 - `BOT_OWNER_ID` — Telegram user ID владельца (становится админом автоматически).
 - `BOT_DB_PATH` — путь к SQLite, по умолчанию `./bot.db`.
+- `VERIFICATION_DB_PATH` — путь к SQLite базе второго бота (`real`) с таблицами `verified_users/verified_usernames`. Если не задан, метки `Проверена. РЕАЛ/ВИРТ` не добавляются.
 - `TEST_MODE` — `true/false`, стартовое значение тестового режима (по умолчанию `true`, потом переключается из админ-панели).
 
 ## Запуск локально
@@ -37,6 +38,7 @@ mvn clean package
 BOT_TOKEN=... \
 BOT_USERNAME=... \
 BOT_OWNER_ID=123456789 \
+VERIFICATION_DB_PATH=/absolute/path/to/real/data/bot.db \
 TEST_MODE=true \
 java -jar target/telegram-stars-post-bot-1.0.0-jar-with-dependencies.jar
 ```
@@ -50,8 +52,10 @@ docker run -d \
   -e BOT_TOKEN=... \
   -e BOT_USERNAME=... \
   -e BOT_OWNER_ID=123456789 \
+  -e VERIFICATION_DB_PATH=/real-data/bot.db \
   -e TEST_MODE=true \
   -e BOT_DB_PATH=/data/bot.db \
   -v $(pwd)/data:/data \
+  -v /absolute/path/to/real/data:/real-data:ro \
   stars-post-bot
 ```

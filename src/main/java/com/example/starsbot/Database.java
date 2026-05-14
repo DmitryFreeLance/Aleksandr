@@ -798,6 +798,24 @@ public class Database {
         return Optional.empty();
     }
 
+    public synchronized Optional<String> getPayerUsernameByDraft(long draftId) throws SQLException {
+        String sql = "SELECT payer_username FROM payments WHERE draft_id = ?";
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, draftId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return Optional.empty();
+                }
+                String username = rs.getString("payer_username");
+                if (username == null || username.isBlank()) {
+                    return Optional.empty();
+                }
+                return Optional.of(username);
+            }
+        }
+    }
+
     public synchronized List<PaymentInfo> listRecentPayments(int limit) throws SQLException {
         String sql = """
                 SELECT id, draft_id, user_id, payer_username, amount, currency, status, created_at

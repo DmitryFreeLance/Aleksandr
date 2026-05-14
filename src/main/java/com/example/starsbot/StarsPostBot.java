@@ -89,15 +89,19 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String PAY_STATUS_COMPLETED = "AUTOPOST_COMPLETED";
     private static final String PAY_STATUS_RUNNING_TEST = "AUTOPOST_RUNNING_TEST";
     private static final String PAY_STATUS_COMPLETED_TEST = "AUTOPOST_COMPLETED_TEST";
+    private static final String VERIFIED_BADGE_REAL = "Проверена. РЕАЛ";
+    private static final String VERIFIED_BADGE_VIRT = "Проверена. ВИРТ";
 
     private final BotConfig config;
     private final Database database;
+    private final VerificationBadgeResolver verificationBadgeResolver;
     private final ScheduledExecutorService autoPostExecutor;
     private final Map<Long, List<PendingMediaItem>> editMediaBuffers;
 
     public StarsPostBot(BotConfig config, Database database) {
         this.config = config;
         this.database = database;
+        this.verificationBadgeResolver = new VerificationBadgeResolver(config.verificationDbPath());
         this.editMediaBuffers = new ConcurrentHashMap<>();
         this.autoPostExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "autopost-scheduler");
@@ -870,7 +874,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
         List<DraftMedia> media = database.listDraftMedia(draft.id());
         Instant now = Instant.now();
         Instant publishUntil = now.plus(CAMPAIGN_DURATION);
-        PublishAttempt firstAttempt = publishDraftToGroup(groupIdOpt.get(), draft, media);
+        PublishAttempt firstAttempt = publishDraftToGroup(groupIdOpt.get(), draft, media, payerUsername);
         if (!firstAttempt.success()) {
             Instant retryAt = now.plusSeconds(resolveRetryDelaySeconds(firstAttempt.retryAfterSeconds(), FIRST_PUBLISH_FALLBACK_RETRY_DELAY));
             database.activateAutoPosting(
@@ -918,12 +922,13 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 """.formatted(simulated ? "🧪 Тестовая оплата подтверждена." : "✅ Оплата подтверждена.", tariff.intervalHours()), inlineKeyboard(row(button("🚀 Новый пост", CB_MAKE_POST))));
     }
 
-    private PublishAttempt publishDraftToGroup(long groupId, Draft draft, List<DraftMedia> media) {
+    private PublishAttempt publishDraftToGroup(long groupId, Draft draft, List<DraftMedia> media, String payerUsername) {
         try {
             if (media == null || media.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
-            List<Message> sent = sendMediaCollection(groupId, media, draft.postText(), null);
+            String caption = decorateCaptionWithVerificationBadge(draft.postText(), draft.userId(), payerUsername);
+            List<Message> sent = sendMediaCollection(groupId, media, caption, null);
             if (sent.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
@@ -988,7 +993,8 @@ public class StarsPostBot extends TelegramLongPollingBot {
             );
 
             List<DraftMedia> media = database.listDraftMedia(job.draftId());
-            PublishAttempt attempt = publishDraftToGroup(groupIdOpt.get(), draft, media);
+            String payerUsername = database.getPayerUsernameByDraft(job.draftId()).orElse(null);
+            PublishAttempt attempt = publishDraftToGroup(groupIdOpt.get(), draft, media, payerUsername);
             if (!attempt.success()) {
                 Instant retryAt = now.plusSeconds(resolveRetryDelaySeconds(attempt.retryAfterSeconds(), FAILED_RETRY_DELAY));
                 database.markAutoPostFailureRetry(job.draftId(), retryAt.toString());
@@ -1626,6 +1632,45 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 • Каждые 4 часа — <b>%d Stars</b>
                 • Каждые 6 часов — <b>%d Stars</b>
                 """.formatted(t2.priceStars(), t4.priceStars(), t6.priceStars()).trim();
+    }
+
+    private String decorateCaptionWithVerificationBadge(String caption, long userId, String username) {
+        String base = caption == null ? "" : caption.trim();
+        Optional<String> badgeOpt = verificationBadgeResolver.resolveBadge(userId, username);
+        if (badgeOpt.isEmpty()) {
+            return base;
+        }
+        if (containsVerificationBadge(base)) {
+            return base;
+        }
+
+        String badge = badgeOpt.get();
+        if (base.isBlank()) {
+            return badge.length() <= MAX_CAPTION_LENGTH ? badge : badge.substring(0, MAX_CAPTION_LENGTH);
+        }
+
+        String combined = base + "\n\n" + badge;
+        if (combined.length() <= MAX_CAPTION_LENGTH) {
+            return combined;
+        }
+
+        int maxBaseLength = MAX_CAPTION_LENGTH - badge.length() - 2;
+        if (maxBaseLength <= 0) {
+            return badge.length() <= MAX_CAPTION_LENGTH ? badge : badge.substring(0, MAX_CAPTION_LENGTH);
+        }
+
+        String shortenedBase = base.length() <= maxBaseLength ? base : base.substring(0, maxBaseLength).trim();
+        if (shortenedBase.isBlank()) {
+            return badge.length() <= MAX_CAPTION_LENGTH ? badge : badge.substring(0, MAX_CAPTION_LENGTH);
+        }
+        log.warn("Caption for user {} was trimmed to fit verification badge", userId);
+        return shortenedBase + "\n\n" + badge;
+    }
+
+    private boolean containsVerificationBadge(String caption) {
+        String lower = caption.toLowerCase(Locale.ROOT);
+        return lower.contains(VERIFIED_BADGE_REAL.toLowerCase(Locale.ROOT))
+                || lower.contains(VERIFIED_BADGE_VIRT.toLowerCase(Locale.ROOT));
     }
 
     private Instant parseInstant(String value) {
