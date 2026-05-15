@@ -931,8 +931,9 @@ public class StarsPostBot extends TelegramLongPollingBot {
             if (sent.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
-            sendVerificationMessage(groupId, sent.get(0).getMessageId(), draft.userId(), payerUsername);
-            return new PublishAttempt(new PublishResult(sent.get(0).getMessageId(), sent.size()), null);
+            int verificationMessagesSent = sendVerificationMessage(groupId, sent.get(0).getMessageId(), draft.userId(), payerUsername);
+            int totalPublishedMessages = sent.size() + verificationMessagesSent;
+            return new PublishAttempt(new PublishResult(sent.get(0).getMessageId(), totalPublishedMessages), null);
         } catch (TelegramApiRequestException e) {
             Integer retryAfter = extractRetryAfterSeconds(e);
             if (retryAfter != null) {
@@ -1634,10 +1635,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 """.formatted(t2.priceStars(), t4.priceStars(), t6.priceStars()).trim();
     }
 
-    private void sendVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
+    private int sendVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
         Optional<String> badge = verificationBadgeResolver.resolveBadge(userId, username);
         if (badge.isEmpty()) {
-            return;
+            return 0;
         }
 
         String text = badge.get().contains("РЕАЛ") ? VERIFIED_MESSAGE_REAL : VERIFIED_MESSAGE_VIRT;
@@ -1647,8 +1648,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
         verificationMessage.setText(text);
         try {
             execute(verificationMessage);
+            return 1;
         } catch (TelegramApiException e) {
             log.warn("Failed to send verification message for user {}", userId, e);
+            return 0;
         }
     }
 
