@@ -26,6 +26,7 @@ import java.util.Optional;
 public class Database {
     private static final String TARGET_GROUP_KEY = "target_group_id";
     private static final String TEST_MODE_KEY = "test_mode";
+    private static final String GROUP_MODERATION_ENABLED_KEY = "group_moderation_enabled";
     private static final String POST_PRICE_STARS_KEY = "post_price_stars";
     private static final String TARIFF_2H_KEY = "tariff_2h_price_stars";
     private static final String TARIFF_4H_KEY = "tariff_4h_price_stars";
@@ -120,6 +121,7 @@ public class Database {
 
     public synchronized void ensureRuntimeDefaults(boolean defaultTestMode, int defaultPostPriceStars) throws SQLException {
         upsertSettingIfAbsent(TEST_MODE_KEY, Boolean.toString(defaultTestMode));
+        upsertSettingIfAbsent(GROUP_MODERATION_ENABLED_KEY, "true");
         upsertSettingIfAbsent(POST_PRICE_STARS_KEY, Integer.toString(defaultPostPriceStars));
         upsertSettingIfAbsent(TARIFF_2H_KEY, "1000");
         upsertSettingIfAbsent(TARIFF_4H_KEY, "700");
@@ -225,6 +227,18 @@ public class Database {
 
     public synchronized void setTestMode(boolean enabled) throws SQLException {
         upsertSetting(TEST_MODE_KEY, Boolean.toString(enabled));
+    }
+
+    public synchronized boolean getGroupModerationEnabled(boolean fallback) throws SQLException {
+        Optional<String> raw = getSetting(GROUP_MODERATION_ENABLED_KEY);
+        if (raw.isEmpty()) {
+            return fallback;
+        }
+        return Boolean.parseBoolean(raw.get());
+    }
+
+    public synchronized void setGroupModerationEnabled(boolean enabled) throws SQLException {
+        upsertSetting(GROUP_MODERATION_ENABLED_KEY, Boolean.toString(enabled));
     }
 
     public synchronized int getPostPriceStars(int fallback) throws SQLException {
@@ -578,6 +592,21 @@ public class Database {
         }
     }
 
+    public synchronized void cancelAutoPosting(long draftId) throws SQLException {
+        String sql = """
+                UPDATE drafts
+                SET status = ?, next_publish_at = NULL, publish_until = NULL, last_group_message_id = NULL, last_group_media_count = 1, updated_at = ?
+                WHERE id = ?
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, DraftStatus.CANCELLED.name());
+            ps.setString(2, now());
+            ps.setLong(3, draftId);
+            ps.executeUpdate();
+        }
+    }
+
     public synchronized List<AutoPostJob> listDueAutoPostJobs(String nowIso, int limit) throws SQLException {
         String sql = """
                 SELECT id, user_id, media_type, media_file_id, post_text,
@@ -662,6 +691,23 @@ public class Database {
             }
         }
         return drafts;
+    }
+
+    public synchronized boolean hasUserActiveAutoPosting(long userId) throws SQLException {
+        String sql = """
+                SELECT 1
+                FROM drafts
+                WHERE user_id = ? AND status = ?
+                LIMIT 1
+                """;
+        try (Connection conn = open();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, userId);
+            ps.setString(2, DraftStatus.ACTIVE.name());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
     }
 
     public synchronized void completeAutoPosting(long draftId, Integer lastGroupMessageId, Integer lastGroupMediaCount, int publishCount) throws SQLException {

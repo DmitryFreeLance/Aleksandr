@@ -75,11 +75,13 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String CB_ADMIN_ADD_ADMIN = "admin_add_admin";
     private static final String CB_ADMIN_REMOVE_MENU = "admin_remove_menu";
     private static final String CB_ADMIN_TOGGLE_TEST_MODE = "admin_toggle_test_mode";
+    private static final String CB_ADMIN_TOGGLE_GROUP_MODERATION = "admin_toggle_group_moderation";
     private static final String CB_ADMIN_EDIT_PRICES = "admin_edit_prices";
     private static final String CB_ADMIN_EDIT_PRICE_PREFIX = "admin_edit_price:";
     private static final String CB_MY_POSTS = "my_posts";
     private static final String CB_EDIT_POST_PREFIX = "edit_post:";
     private static final String CB_EDIT_POST_START_PREFIX = "edit_post_start:";
+    private static final String CB_STOP_POST_PREFIX = "stop_post:";
     private static final String CB_MEDIA_DONE_PREFIX = "media_done:";
     private static final String CB_CANCEL_FLOW = "cancel_flow";
     private static final String CB_TARIFF_PREFIX = "tariff:";
@@ -149,11 +151,13 @@ public class StarsPostBot extends TelegramLongPollingBot {
 
         long userId = message.getFrom().getId();
         String username = message.getFrom().getUserName();
-        if (database.isAdmin(userId)) {
+        boolean isAdmin = database.isAdmin(userId);
+        if (isAdmin) {
             database.touchAdminUsername(userId, username);
         }
 
         if (!isPrivateMessage(message)) {
+            moderateGroupMessage(message, userId, isAdmin);
             return;
         }
 
@@ -247,6 +251,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
             startEditPostFlow(query, parseIdSuffix(data, CB_EDIT_POST_START_PREFIX));
             return;
         }
+        if (data.startsWith(CB_STOP_POST_PREFIX)) {
+            stopPostCampaign(query, parseIdSuffix(data, CB_STOP_POST_PREFIX));
+            return;
+        }
         if (data.startsWith(CB_EDIT_POST_PREFIX)) {
             showPostActions(query, parseIdSuffix(data, CB_EDIT_POST_PREFIX));
             return;
@@ -291,6 +299,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
         }
         if (CB_ADMIN_TOGGLE_TEST_MODE.equals(data)) {
             adminToggleTestMode(query);
+            return;
+        }
+        if (CB_ADMIN_TOGGLE_GROUP_MODERATION.equals(data)) {
+            adminToggleGroupModeration(query);
             return;
         }
         if (CB_ADMIN_EDIT_PRICES.equals(data)) {
@@ -551,7 +563,33 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 Активен до: <b>%s</b>
                 """.formatted(draft.id(), draft.tariffIntervalHours(), until), inlineKeyboard(
                 row(button("✏️ Изменить", CB_EDIT_POST_START_PREFIX + draftId)),
+                row(button("🛑 Остановить кампанию", CB_STOP_POST_PREFIX + draftId)),
                 row(button("⬅️ Назад", CB_MY_POSTS))
+        ));
+    }
+
+    private void stopPostCampaign(CallbackQuery query, long draftId) throws Exception {
+        long userId = query.getFrom().getId();
+        Optional<Draft> draftOpt = database.getDraft(draftId);
+        if (draftOpt.isEmpty() || draftOpt.get().userId() != userId || draftOpt.get().status() != DraftStatus.ACTIVE) {
+            answerCallback(query.getId(), "Кампания уже недоступна", true);
+            return;
+        }
+        Draft draft = draftOpt.get();
+
+        Optional<Long> groupIdOpt = database.getTargetGroupId();
+        if (groupIdOpt.isPresent() && draft.lastGroupMessageId() != null) {
+            int count = draft.lastGroupMediaCount() == null || draft.lastGroupMediaCount() <= 0 ? 1 : draft.lastGroupMediaCount();
+            deleteGroupMessagesSilently(groupIdOpt.get(), draft.lastGroupMessageId(), count);
+        }
+
+        database.cancelAutoPosting(draftId);
+        database.updatePaymentStatusByDraft(draftId, mapCompletedStatus(draftId));
+        editMediaBuffers.remove(draftId);
+        answerCallback(query.getId(), "Кампания остановлена", false);
+        sendText(query.getMessage().getChatId(), "🛑 Кампания автопостинга остановлена.", inlineKeyboard(
+                row(button("📂 Мои посты", CB_MY_POSTS)),
+                row(button("🚀 Новый пост", CB_MAKE_POST))
         ));
     }
 
@@ -972,11 +1010,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 continue;
             }
 
-            if (job.lastGroupMessageId() != null) {
-                int count = job.lastGroupMediaCount() == null || job.lastGroupMediaCount() <= 0 ? 1 : job.lastGroupMediaCount();
-                deleteGroupMessagesSilently(groupIdOpt.get(), job.lastGroupMessageId(), count);
-            }
-
             Draft draft = new Draft(
                     job.draftId(),
                     job.userId(),
@@ -1059,6 +1092,19 @@ public class StarsPostBot extends TelegramLongPollingBot {
         boolean newValue = !isTestModeEnabled();
         database.setTestMode(newValue);
         answerCallback(query.getId(), newValue ? "Тестовый режим включен" : "Тестовый режим выключен", false);
+        sendAdminPanel(query.getMessage().getChatId());
+    }
+
+    private void adminToggleGroupModeration(CallbackQuery query) throws Exception {
+        long userId = query.getFrom().getId();
+        if (!database.isAdmin(userId)) {
+            answerCallback(query.getId(), "Недостаточно прав", true);
+            return;
+        }
+
+        boolean newValue = !isGroupModerationEnabled();
+        database.setGroupModerationEnabled(newValue);
+        answerCallback(query.getId(), newValue ? "Модерация группы включена" : "Модерация группы выключена", false);
         sendAdminPanel(query.getMessage().getChatId());
     }
 
@@ -1272,6 +1318,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
         Optional<Long> groupId = database.getTargetGroupId();
         String groupValue = groupId.map(String::valueOf).orElse("не задана");
         boolean testMode = isTestModeEnabled();
+        boolean moderationEnabled = isGroupModerationEnabled();
         TariffPlan t2 = tariffByInterval(2);
         TariffPlan t4 = tariffByInterval(4);
         TariffPlan t6 = tariffByInterval(6);
@@ -1280,10 +1327,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
 
                 📌 Группа: <code>%s</code>
                 🧪 Тестовый режим: <b>%s</b>
+                🧹 Модерация группы: <b>%s</b>
                 📅 Автопостинг: <b>7 дней</b>
                 💰 Тарифы: 2ч=%d ⭐ | 4ч=%d ⭐ | 6ч=%d ⭐
                 Управляйте настройками и модерацией через кнопки ниже.
-                """.formatted(groupValue, testMode ? "ВКЛ" : "ВЫКЛ", t2.priceStars(), t4.priceStars(), t6.priceStars()), adminPanelKeyboard(testMode));
+                """.formatted(groupValue, testMode ? "ВКЛ" : "ВЫКЛ", moderationEnabled ? "ВКЛ" : "ВЫКЛ", t2.priceStars(), t4.priceStars(), t6.priceStars()), adminPanelKeyboard(testMode, moderationEnabled));
     }
 
     private void sendAdminPanel(long chatId) throws Exception {
@@ -1337,12 +1385,14 @@ public class StarsPostBot extends TelegramLongPollingBot {
         return inlineKeyboard(rows.toArray(List[]::new));
     }
 
-    private InlineKeyboardMarkup adminPanelKeyboard(boolean testMode) {
+    private InlineKeyboardMarkup adminPanelKeyboard(boolean testMode, boolean moderationEnabled) {
         String toggleLabel = testMode ? "🧪 Выключить тестовый режим" : "🧪 Включить тестовый режим";
+        String moderationLabel = moderationEnabled ? "🧹 Выключить модерацию" : "🧹 Включить модерацию";
         return inlineKeyboard(
                 row(button("📌 Задать группу", CB_ADMIN_SET_GROUP)),
                 row(button("💰 Изменить цены тарифов", CB_ADMIN_EDIT_PRICES)),
                 row(button(toggleLabel, CB_ADMIN_TOGGLE_TEST_MODE)),
+                row(button(moderationLabel, CB_ADMIN_TOGGLE_GROUP_MODERATION)),
                 row(button("💳 Последние оплаты", CB_ADMIN_LAST_PAYMENTS)),
                 row(button("👮 Список админов", CB_ADMIN_LIST_ADMINS)),
                 row(button("➕ Добавить админа", CB_ADMIN_ADD_ADMIN)),
@@ -1426,6 +1476,38 @@ public class StarsPostBot extends TelegramLongPollingBot {
             execute(delete);
         } catch (TelegramApiException e) {
             log.warn("Failed to delete old group message {} in {}", messageId, groupId, e);
+        }
+    }
+
+    private void moderateGroupMessage(Message message, long userId, boolean isAdmin) {
+        try {
+            if (isAdmin) {
+                return;
+            }
+            if (message.getFrom() != null && Boolean.TRUE.equals(message.getFrom().getIsBot())) {
+                return;
+            }
+
+            Optional<Long> targetGroupOpt = database.getTargetGroupId();
+            if (targetGroupOpt.isEmpty()) {
+                return;
+            }
+            Long chatId = message.getChatId();
+            if (chatId == null || chatId.longValue() != targetGroupOpt.get().longValue()) {
+                return;
+            }
+            if (!isGroupModerationEnabled()) {
+                return;
+            }
+
+            boolean hasActiveCampaign = database.hasUserActiveAutoPosting(userId);
+            if (hasActiveCampaign) {
+                return;
+            }
+
+            deleteGroupMessageSilently(chatId, message.getMessageId());
+        } catch (Exception e) {
+            log.warn("Failed to moderate message {} in chat {}", message.getMessageId(), message.getChatId(), e);
         }
     }
 
@@ -1588,6 +1670,10 @@ public class StarsPostBot extends TelegramLongPollingBot {
 
     private boolean isTestModeEnabled() throws SQLException {
         return database.getTestMode(config.testMode());
+    }
+
+    private boolean isGroupModerationEnabled() throws SQLException {
+        return database.getGroupModerationEnabled(true);
     }
 
     private TariffPlan tariffFromDraft(Draft draft) {
