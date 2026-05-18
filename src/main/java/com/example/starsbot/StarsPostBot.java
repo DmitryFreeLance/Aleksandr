@@ -92,19 +92,15 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String PAY_STATUS_COMPLETED = "AUTOPOST_COMPLETED";
     private static final String PAY_STATUS_RUNNING_TEST = "AUTOPOST_RUNNING_TEST";
     private static final String PAY_STATUS_COMPLETED_TEST = "AUTOPOST_COMPLETED_TEST";
-    private static final String VERIFIED_MESSAGE_REAL = "Проверена. РЕАЛ ☝️";
-    private static final String VERIFIED_MESSAGE_VIRT = "Проверена. ВИРТ ☝️";
 
     private final BotConfig config;
     private final Database database;
-    private final VerificationBadgeResolver verificationBadgeResolver;
     private final ScheduledExecutorService autoPostExecutor;
     private final Map<Long, List<PendingMediaItem>> editMediaBuffers;
 
     public StarsPostBot(BotConfig config, Database database) {
         this.config = config;
         this.database = database;
-        this.verificationBadgeResolver = new VerificationBadgeResolver(config.verificationDbPath());
         this.editMediaBuffers = new ConcurrentHashMap<>();
         this.autoPostExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "autopost-scheduler");
@@ -970,7 +966,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
             if (sent.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
-            sendVerificationMessage(groupId, sent.get(0).getMessageId(), draft.userId(), payerUsername);
             int totalPublishedMessages = sent.size();
             return new PublishAttempt(new PublishResult(sent.get(0).getMessageId(), totalPublishedMessages), null);
         } catch (TelegramApiRequestException e) {
@@ -1741,23 +1736,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
         long lagSeconds = Math.max(0L, Duration.between(next, now).getSeconds());
         long intervalsMissed = lagSeconds / Math.max(1L, intervalSeconds);
         return next.plusSeconds((intervalsMissed + 1) * intervalSeconds);
-    }
-
-    private void sendVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
-        Optional<String> badge = verificationBadgeResolver.resolveBadge(userId, username);
-        if (badge.isEmpty()) {
-            return;
-        }
-        String text = "REAL".equals(badge.get()) ? VERIFIED_MESSAGE_REAL : VERIFIED_MESSAGE_VIRT;
-        SendMessage verificationMessage = new SendMessage();
-        verificationMessage.setChatId(String.valueOf(chatId));
-        verificationMessage.setReplyToMessageId(replyToMessageId);
-        verificationMessage.setText(text);
-        try {
-            execute(verificationMessage);
-        } catch (TelegramApiException e) {
-            log.warn("Failed to send verification message for user {}", userId, e);
-        }
     }
 
     private Instant parseInstant(String value) {

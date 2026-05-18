@@ -5,7 +5,6 @@ public record BotConfig(
         String username,
         long ownerId,
         String dbPath,
-        String verificationDbPath,
         int postPriceStars,
         boolean testMode
 ) {
@@ -14,10 +13,9 @@ public record BotConfig(
         String username = required("BOT_USERNAME");
         long ownerId = Long.parseLong(required("BOT_OWNER_ID"));
         String dbPath = getenvOrDefault("BOT_DB_PATH", "./bot.db");
-        String verificationDbPath = optionalEnv("VERIFICATION_DB_PATH");
         int postPriceStars = Integer.parseInt(getenvOrDefault("POST_PRICE_STARS", "100"));
         boolean testMode = Boolean.parseBoolean(getenvOrDefault("TEST_MODE", "true"));
-        return new BotConfig(token, username, ownerId, dbPath, verificationDbPath, postPriceStars, testMode);
+        return new BotConfig(token, username, ownerId, dbPath, postPriceStars, testMode);
     }
 
     private static String required(String key) {
@@ -32,14 +30,6 @@ public record BotConfig(
         String value = System.getenv(key);
         if (value == null || value.isBlank()) {
             return defaultValue;
-        }
-        return value;
-    }
-
-    private static String optionalEnv(String key) {
-        String value = System.getenv(key);
-        if (value == null || value.isBlank()) {
-            return null;
         }
         return value;
     }
