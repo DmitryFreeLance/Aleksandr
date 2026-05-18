@@ -98,13 +98,21 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private final Database database;
     private final VerificationBadgeResolver verificationBadgeResolver;
     private final ScheduledExecutorService autoPostExecutor;
+    private final ScheduledExecutorService verificationExecutor;
     private final Map<Long, List<PendingMediaItem>> editMediaBuffers;
+    private volatile long verificationSendMutedUntilEpochSec;
 
     public StarsPostBot(BotConfig config, Database database) {
         this.config = config;
         this.database = database;
         this.verificationBadgeResolver = new VerificationBadgeResolver(config.verificationDbPath());
         this.editMediaBuffers = new ConcurrentHashMap<>();
+        this.verificationSendMutedUntilEpochSec = 0L;
+        this.verificationExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "verification-sender");
+            t.setDaemon(true);
+            return t;
+        });
         this.autoPostExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "autopost-scheduler");
             t.setDaemon(true);
@@ -969,8 +977,8 @@ public class StarsPostBot extends TelegramLongPollingBot {
             if (sent.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
-            int verificationMessagesSent = sendVerificationMessage(groupId, sent.get(0).getMessageId(), draft.userId(), payerUsername);
-            int totalPublishedMessages = sent.size() + verificationMessagesSent;
+            scheduleVerificationMessage(groupId, sent.get(0).getMessageId(), draft.userId(), payerUsername);
+            int totalPublishedMessages = sent.size();
             return new PublishAttempt(new PublishResult(sent.get(0).getMessageId(), totalPublishedMessages), null);
         } catch (TelegramApiRequestException e) {
             Integer retryAfter = extractRetryAfterSeconds(e);
@@ -1722,6 +1730,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
     }
 
     private int sendVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
+        long nowEpochSec = Instant.now().getEpochSecond();
+        if (nowEpochSec < verificationSendMutedUntilEpochSec) {
+            return 0;
+        }
+
         Optional<String> badge = verificationBadgeResolver.resolveBadge(userId, username);
         if (badge.isEmpty()) {
             return 0;
@@ -1735,10 +1748,22 @@ public class StarsPostBot extends TelegramLongPollingBot {
         try {
             execute(verificationMessage);
             return 1;
+        } catch (TelegramApiRequestException e) {
+            Integer retryAfter = extractRetryAfterSeconds(e);
+            if (retryAfter != null && retryAfter > 0) {
+                verificationSendMutedUntilEpochSec = Instant.now().getEpochSecond() + retryAfter;
+                log.warn("Verification messages muted for {} sec due to Telegram 429", retryAfter);
+            }
+            log.warn("Failed to send verification message for user {}", userId, e);
+            return 0;
         } catch (TelegramApiException e) {
             log.warn("Failed to send verification message for user {}", userId, e);
             return 0;
         }
+    }
+
+    private void scheduleVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
+        verificationExecutor.execute(() -> sendVerificationMessage(chatId, replyToMessageId, userId, username));
     }
 
     private Instant parseInstant(String value) {

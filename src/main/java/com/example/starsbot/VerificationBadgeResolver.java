@@ -25,7 +25,8 @@ public class VerificationBadgeResolver {
             this.enabled = false;
             return;
         }
-        this.jdbcUrl = "jdbc:sqlite:" + verificationDbPath;
+        String uriPath = verificationDbPath.replace(" ", "%20");
+        this.jdbcUrl = "jdbc:sqlite:file:" + uriPath + "?mode=ro&busy_timeout=700";
         this.enabled = true;
     }
 
