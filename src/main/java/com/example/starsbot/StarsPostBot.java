@@ -1525,6 +1525,11 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return;
         }
 
+        Integer repliedMessageId = extractRepliedMessageId(message);
+        if (repliedMessageId != null && database.hasActiveAutoPostingByGroupMessageId(repliedMessageId)) {
+            return;
+        }
+
         Long repliedUserId = extractRepliedUserId(message);
         if (repliedUserId != null) {
             if (database.isAdmin(repliedUserId)) {
@@ -1544,6 +1549,14 @@ public class StarsPostBot extends TelegramLongPollingBot {
             return null;
         }
         return replied.getFrom().getId();
+    }
+
+    private Integer extractRepliedMessageId(Message message) {
+        Message replied = message.getReplyToMessage();
+        if (replied == null) {
+            return null;
+        }
+        return replied.getMessageId();
     }
 
     private boolean isVerificationBadgeMessage(Message message) {
