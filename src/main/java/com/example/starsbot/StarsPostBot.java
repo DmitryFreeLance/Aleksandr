@@ -1489,13 +1489,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
 
     private void moderateGroupMessage(Message message, long userId, boolean isAdmin) {
         try {
-            if (isAdmin) {
-                return;
-            }
-            if (message.getFrom() != null && Boolean.TRUE.equals(message.getFrom().getIsBot())) {
-                return;
-            }
-
             Optional<Long> targetGroupOpt = database.getTargetGroupId();
             if (targetGroupOpt.isEmpty()) {
                 return;
@@ -1508,6 +1501,14 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 return;
             }
 
+            if (isAdmin) {
+                return;
+            }
+            if (message.getFrom() != null && Boolean.TRUE.equals(message.getFrom().getIsBot())) {
+                handleVerificationBadgeModeration(message, chatId);
+                return;
+            }
+
             boolean hasActiveCampaign = database.hasUserActiveAutoPosting(userId);
             if (hasActiveCampaign) {
                 return;
@@ -1517,6 +1518,44 @@ public class StarsPostBot extends TelegramLongPollingBot {
         } catch (Exception e) {
             log.warn("Failed to moderate message {} in chat {}", message.getMessageId(), message.getChatId(), e);
         }
+    }
+
+    private void handleVerificationBadgeModeration(Message message, long chatId) throws SQLException {
+        if (!isVerificationBadgeMessage(message)) {
+            return;
+        }
+
+        Long repliedUserId = extractRepliedUserId(message);
+        if (repliedUserId != null) {
+            if (database.isAdmin(repliedUserId)) {
+                return;
+            }
+            if (database.hasUserActiveAutoPosting(repliedUserId)) {
+                return;
+            }
+        }
+
+        deleteGroupMessageSilently(chatId, message.getMessageId());
+    }
+
+    private Long extractRepliedUserId(Message message) {
+        Message replied = message.getReplyToMessage();
+        if (replied == null || replied.getFrom() == null) {
+            return null;
+        }
+        return replied.getFrom().getId();
+    }
+
+    private boolean isVerificationBadgeMessage(Message message) {
+        String text = message.getText();
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String normalized = text.trim().toLowerCase(Locale.ROOT);
+        return normalized.startsWith("проверена. реал")
+                || normalized.startsWith("проверена. вирт")
+                || normalized.startsWith("проверена реал")
+                || normalized.startsWith("проверена вирт");
     }
 
     private boolean appendMediaFromMessage(long draftId, Message message) throws SQLException {
