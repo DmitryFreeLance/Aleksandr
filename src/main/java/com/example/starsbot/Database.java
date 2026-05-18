@@ -627,10 +627,9 @@ public class Database {
             ps.setInt(3, limit);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    String mediaTypeRaw = rs.getString("media_type");
-                    MediaType mediaType = mediaTypeRaw == null ? null : MediaType.valueOf(mediaTypeRaw);
+                    MediaType mediaType = parseMediaTypeOrNull(rs.getString("media_type"));
                     Integer intervalHours = getNullableInt(rs, "tariff_interval_hours");
-                    if (mediaType == null || intervalHours == null || intervalHours <= 0) {
+                    if (intervalHours == null || intervalHours <= 0) {
                         continue;
                     }
                     jobs.add(new AutoPostJob(
@@ -670,8 +669,7 @@ public class Database {
             ps.setInt(3, limit);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    String mediaTypeRaw = rs.getString("media_type");
-                    MediaType mediaType = mediaTypeRaw == null ? null : MediaType.valueOf(mediaTypeRaw);
+                    MediaType mediaType = parseMediaTypeOrNull(rs.getString("media_type"));
                     drafts.add(new Draft(
                             rs.getLong("id"),
                             rs.getLong("user_id"),
@@ -951,6 +949,17 @@ public class Database {
     private Integer getNullableInt(ResultSet rs, String column) throws SQLException {
         int value = rs.getInt(column);
         return rs.wasNull() ? null : value;
+    }
+
+    private MediaType parseMediaTypeOrNull(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return MediaType.valueOf(raw);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     private String tariffKey(int intervalHours) {
