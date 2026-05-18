@@ -710,23 +710,6 @@ public class Database {
         }
     }
 
-    public synchronized boolean hasActiveAutoPostingByGroupMessageId(int groupMessageId) throws SQLException {
-        String sql = """
-                SELECT 1
-                FROM drafts
-                WHERE status = ? AND last_group_message_id = ?
-                LIMIT 1
-                """;
-        try (Connection conn = open();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, DraftStatus.ACTIVE.name());
-            ps.setInt(2, groupMessageId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
-            }
-        }
-    }
-
     public synchronized void completeAutoPosting(long draftId, Integer lastGroupMessageId, Integer lastGroupMediaCount, int publishCount) throws SQLException {
         String sql = """
                 UPDATE drafts

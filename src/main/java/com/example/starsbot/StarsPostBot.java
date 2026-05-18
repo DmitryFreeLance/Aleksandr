@@ -65,6 +65,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final Duration FAILED_RETRY_DELAY = Duration.ofMinutes(10);
     private static final Duration FIRST_PUBLISH_FALLBACK_RETRY_DELAY = Duration.ofMinutes(2);
     private static final int RETRY_PADDING_SECONDS = 2;
+    private static final int AUTOPOST_STAGGER_WINDOW_SECONDS = 20;
 
     private static final String CB_MAKE_POST = "make_post";
     private static final String CB_ADMIN_MENU = "admin_menu";
@@ -91,28 +92,16 @@ public class StarsPostBot extends TelegramLongPollingBot {
     private static final String PAY_STATUS_COMPLETED = "AUTOPOST_COMPLETED";
     private static final String PAY_STATUS_RUNNING_TEST = "AUTOPOST_RUNNING_TEST";
     private static final String PAY_STATUS_COMPLETED_TEST = "AUTOPOST_COMPLETED_TEST";
-    private static final String VERIFIED_MESSAGE_REAL = "Проверена. РЕАЛ ☝️";
-    private static final String VERIFIED_MESSAGE_VIRT = "Проверена. ВИРТ ☝️";
 
     private final BotConfig config;
     private final Database database;
-    private final VerificationBadgeResolver verificationBadgeResolver;
     private final ScheduledExecutorService autoPostExecutor;
-    private final ScheduledExecutorService verificationExecutor;
     private final Map<Long, List<PendingMediaItem>> editMediaBuffers;
-    private volatile long verificationSendMutedUntilEpochSec;
 
     public StarsPostBot(BotConfig config, Database database) {
         this.config = config;
         this.database = database;
-        this.verificationBadgeResolver = new VerificationBadgeResolver(config.verificationDbPath());
         this.editMediaBuffers = new ConcurrentHashMap<>();
-        this.verificationSendMutedUntilEpochSec = 0L;
-        this.verificationExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "verification-sender");
-            t.setDaemon(true);
-            return t;
-        });
         this.autoPostExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "autopost-scheduler");
             t.setDaemon(true);
@@ -948,7 +937,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
         }
 
         PublishResult firstPublish = firstAttempt.result();
-        Instant nextPublishAt = now.plus(Duration.ofHours(tariff.intervalHours()));
+        Instant nextPublishAt = computeInitialNextPublishAt(now, tariff.intervalHours(), draft.id());
         database.activateAutoPosting(
                 draft.id(),
                 nextPublishAt.toString(),
@@ -977,7 +966,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
             if (sent.isEmpty()) {
                 return new PublishAttempt(null, null);
             }
-            scheduleVerificationMessage(groupId, sent.get(0).getMessageId(), draft.userId(), payerUsername);
             int totalPublishedMessages = sent.size();
             return new PublishAttempt(new PublishResult(sent.get(0).getMessageId(), totalPublishedMessages), null);
         } catch (TelegramApiRequestException e) {
@@ -1011,6 +999,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
         Instant now = Instant.now();
         List<AutoPostJob> jobs = database.listDueAutoPostJobs(now.toString(), 20);
         for (AutoPostJob job : jobs) {
+            now = Instant.now();
             Instant publishUntil = parseInstant(job.publishUntil());
             if (publishUntil == null || !now.isBefore(publishUntil)) {
                 database.completeAutoPosting(job.draftId(), job.lastGroupMessageId(), job.lastGroupMediaCount(), job.publishCount());
@@ -1045,7 +1034,7 @@ public class StarsPostBot extends TelegramLongPollingBot {
             PublishResult result = attempt.result();
 
             int newCount = job.publishCount() + 1;
-            Instant nextPublish = now.plus(Duration.ofHours(job.tariffIntervalHours()));
+            Instant nextPublish = computeFollowupNextPublishAt(job, now);
             if (!nextPublish.isBefore(publishUntil)) {
                 database.completeAutoPosting(job.draftId(), result.firstMessageId(), result.messageCount(), newCount);
                 database.updatePaymentStatusByDraft(job.draftId(), mapCompletedStatus(job.draftId()));
@@ -1505,7 +1494,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 return;
             }
             if (message.getFrom() != null && Boolean.TRUE.equals(message.getFrom().getIsBot())) {
-                handleVerificationBadgeModeration(message, chatId);
                 return;
             }
 
@@ -1518,57 +1506,6 @@ public class StarsPostBot extends TelegramLongPollingBot {
         } catch (Exception e) {
             log.warn("Failed to moderate message {} in chat {}", message.getMessageId(), message.getChatId(), e);
         }
-    }
-
-    private void handleVerificationBadgeModeration(Message message, long chatId) throws SQLException {
-        if (!isVerificationBadgeMessage(message)) {
-            return;
-        }
-
-        Integer repliedMessageId = extractRepliedMessageId(message);
-        if (repliedMessageId != null && database.hasActiveAutoPostingByGroupMessageId(repliedMessageId)) {
-            return;
-        }
-
-        Long repliedUserId = extractRepliedUserId(message);
-        if (repliedUserId != null) {
-            if (database.isAdmin(repliedUserId)) {
-                return;
-            }
-            if (database.hasUserActiveAutoPosting(repliedUserId)) {
-                return;
-            }
-        }
-
-        deleteGroupMessageSilently(chatId, message.getMessageId());
-    }
-
-    private Long extractRepliedUserId(Message message) {
-        Message replied = message.getReplyToMessage();
-        if (replied == null || replied.getFrom() == null) {
-            return null;
-        }
-        return replied.getFrom().getId();
-    }
-
-    private Integer extractRepliedMessageId(Message message) {
-        Message replied = message.getReplyToMessage();
-        if (replied == null) {
-            return null;
-        }
-        return replied.getMessageId();
-    }
-
-    private boolean isVerificationBadgeMessage(Message message) {
-        String text = message.getText();
-        if (text == null || text.isBlank()) {
-            return false;
-        }
-        String normalized = text.trim().toLowerCase(Locale.ROOT);
-        return normalized.startsWith("проверена. реал")
-                || normalized.startsWith("проверена. вирт")
-                || normalized.startsWith("проверена реал")
-                || normalized.startsWith("проверена вирт");
     }
 
     private boolean appendMediaFromMessage(long draftId, Message message) throws SQLException {
@@ -1781,41 +1718,24 @@ public class StarsPostBot extends TelegramLongPollingBot {
                 """.formatted(t2.priceStars(), t4.priceStars(), t6.priceStars()).trim();
     }
 
-    private int sendVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
-        long nowEpochSec = Instant.now().getEpochSecond();
-        if (nowEpochSec < verificationSendMutedUntilEpochSec) {
-            return 0;
-        }
-
-        Optional<String> badge = verificationBadgeResolver.resolveBadge(userId, username);
-        if (badge.isEmpty()) {
-            return 0;
-        }
-
-        String text = badge.get().contains("РЕАЛ") ? VERIFIED_MESSAGE_REAL : VERIFIED_MESSAGE_VIRT;
-        SendMessage verificationMessage = new SendMessage();
-        verificationMessage.setChatId(String.valueOf(chatId));
-        verificationMessage.setReplyToMessageId(replyToMessageId);
-        verificationMessage.setText(text);
-        try {
-            execute(verificationMessage);
-            return 1;
-        } catch (TelegramApiRequestException e) {
-            Integer retryAfter = extractRetryAfterSeconds(e);
-            if (retryAfter != null && retryAfter > 0) {
-                verificationSendMutedUntilEpochSec = Instant.now().getEpochSecond() + retryAfter;
-                log.warn("Verification messages muted for {} sec due to Telegram 429", retryAfter);
-            }
-            log.warn("Failed to send verification message for user {}", userId, e);
-            return 0;
-        } catch (TelegramApiException e) {
-            log.warn("Failed to send verification message for user {}", userId, e);
-            return 0;
-        }
+    private Instant computeInitialNextPublishAt(Instant now, int intervalHours, long draftId) {
+        long staggerSeconds = Math.floorMod(draftId, AUTOPOST_STAGGER_WINDOW_SECONDS + 1L);
+        return now.plus(Duration.ofHours(intervalHours)).plusSeconds(staggerSeconds);
     }
 
-    private void scheduleVerificationMessage(long chatId, int replyToMessageId, long userId, String username) {
-        verificationExecutor.execute(() -> sendVerificationMessage(chatId, replyToMessageId, userId, username));
+    private Instant computeFollowupNextPublishAt(AutoPostJob job, Instant now) {
+        Instant scheduled = parseInstant(job.nextPublishAt());
+        if (scheduled == null) {
+            return computeInitialNextPublishAt(now, job.tariffIntervalHours(), job.draftId());
+        }
+        Instant next = scheduled.plus(Duration.ofHours(job.tariffIntervalHours()));
+        if (next.isAfter(now)) {
+            return next;
+        }
+        long intervalSeconds = Duration.ofHours(job.tariffIntervalHours()).getSeconds();
+        long lagSeconds = Math.max(0L, Duration.between(next, now).getSeconds());
+        long intervalsMissed = lagSeconds / Math.max(1L, intervalSeconds);
+        return next.plusSeconds((intervalsMissed + 1) * intervalSeconds);
     }
 
     private Instant parseInstant(String value) {
